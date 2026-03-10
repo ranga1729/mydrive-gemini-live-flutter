@@ -1,14 +1,13 @@
 /// MyDrive — Flutter Voice + Text Client for Gemini Live FastAPI Backend
 ///
-/// ── pubspec.yaml dependencies (no changes needed) ────────────────────────────
+/// ── pubspec.yaml dependencies ────────────────────────────────────────────────
 /// dependencies:
 ///   flutter:
 ///     sdk: flutter
 ///   record: ^6.2.0
-///   just_audio: ^0.10.5
+///   flutter_pcm_sound: ^0.9.0        ← replaces just_audio for raw PCM streaming
 ///   web_socket_channel: ^3.0.1
 ///   permission_handler: ^12.0.1
-///   path_provider: ^2.1.3
 ///
 /// ── Android — AndroidManifest.xml (inside <manifest>) ────────────────────────
 ///   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
@@ -18,39 +17,27 @@
 ///   <key>NSMicrophoneUsageDescription</key>
 ///   <string>MyDrive needs the microphone to send voice messages.</string>
 ///
-/// ── Backend WebSocket protocol ────────────────────────────────────────────────
+/// ── Audio pipeline (redesigned) ───────────────────────────────────────────────
+///   Recording : 16-bit PCM, 16 kHz, mono  → /ws/chat as raw bytes
+///   Playback  : raw 24 kHz PCM chunks fed directly into flutter_pcm_sound
+///               which maintains its own native ring-buffer — zero file I/O,
+///               zero gap between chunks, buttery-smooth continuous playback.
 ///
-/// /ws/chat  (voice channel):
-///   Client → server : binary PCM frames (16-bit, 16 kHz, mono)
-///                     then text frame "END_OF_SPEECH"
-///   Server → client : binary PCM frames (16-bit, 24 kHz, mono)
-///                     + JSON frames (see below)
+/// ── Key changes from original ─────────────────────────────────────────────────
+///   BEFORE: just_audio played one temp WAV file per chunk (file-write + cold-
+///           start overhead per chunk → audible gaps / stuttering).
+///   AFTER : flutter_pcm_sound.feed() pushes Int16List frames directly into the
+///           native audio output buffer. The OS mixer handles continuity — no
+///           gaps, no file I/O, no per-chunk player lifecycle.
 ///
-/// /ws/text  (text channel):
-///   Client → server : {"type":"message","text":"..."}
-///   Server → client : binary PCM frames + JSON frames
-///
-/// JSON frames server → client:
-///   {"status":"ready"}
-///   {"status":"processing"}
-///   {"status":"done"}
-///   {"status":"interrupted"}
-///   {"status":"error","message":"..."}
-///   {"type":"gemini_transcript","text":"..."}  ← AI spoken words (streamed)
-///   {"type":"user_transcript","text":"..."}    ← User voice words
-///   {"type":"tool_call","tool":"...","args":{…},"result":{…}}
-///
-/// ── Audio chain ────────────────────────────────────────────────────────────────
-///   Recording  : 16-bit PCM, 16 kHz, mono  → /ws/chat as raw bytes
-///   Playback   : receive raw 24 kHz PCM → wrap in WAV header → just_audio
-///
-/// ── Key design decisions ───────────────────────────────────────────────────────
-///   • Both WS channels share one _onFrame() dispatcher (type-safe routing).
-///   • _turnDone flag + 200 ms idle timeout mirrors the HTML client's
-///     drainAudioQueue() so audio is never cut short.
-///   • Gemini transcript is streamed into one bubble incrementally.
-///   • User voice bubble starts as a placeholder, replaced by user_transcript.
-///   • ToolCard is a first-class item type — rendered after audio drains.
+///   • _AudioStreamer encapsulates all playback state (single responsibility).
+///   • Feed threshold (numChannels * sampleRate ÷ 4 = ~6 000 samples) keeps
+///     the native buffer topped-up without over-buffering — standard practice
+///     for real-time PCM streaming (matches WebRTC / Opus decoder patterns).
+///   • Reconnect back-off is now exponential (1s → 2s → 4s … cap 16s) to
+///     avoid hammering the server on flaky networks.
+///   • _turnDone / idle-timeout logic is preserved but now operates on the
+///     _AudioStreamer rather than a file-based queue.
 
 library;
 
@@ -60,8 +47,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:just_audio/just_audio.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:web_socket_channel/io.dart';
@@ -72,8 +58,14 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 // ════════════════════════════════════════════════════════════════════════════════
 
 const String _kBaseHost = 'mydrive-gemini-live-cueufbg0avdtg3de.canadacentral-01.azurewebsites.net';
-const String _kVoiceUrl = 'wss://$_kBaseHost/ws/chat';  // ← wss://, no port, /ws/chat
-const String _kTextUrl  = 'wss://$_kBaseHost/ws/text';  // ← wss://, no port, /ws/text
+const String _kVoiceUrl = 'wss://$_kBaseHost/ws/chat';
+const String _kTextUrl  = 'wss://$_kBaseHost/ws/text';
+
+/// Output sample rate sent by the Gemini backend (24 kHz, mono, 16-bit).
+const int _kOutputSampleRate = 24000;
+
+/// Input sample rate required by Gemini voice input (16 kHz, mono, 16-bit).
+const int _kInputSampleRate  = 16000;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // Entry point
@@ -113,16 +105,14 @@ class MyDriveApp extends StatelessWidget {
 enum _Role  { user, assistant }
 enum _Input { voice, text }
 
-/// Sealed item hierarchy — every row in the list is one of these.
 sealed class ChatItem {
   final DateTime time;
   const ChatItem({required this.time});
 }
 
-/// Plain text speech bubble.
 final class BubbleItem extends ChatItem {
   final _Role   role;
-  final _Input? input; // only set for user bubbles
+  final _Input? input;
   final String  text;
   const BubbleItem({
     required super.time,
@@ -139,7 +129,6 @@ final class BubbleItem extends ChatItem {
   );
 }
 
-/// Service-action card shown when the backend fires a tool.
 final class ToolItem extends ChatItem {
   final String               tool;
   final Map<String, dynamic> args;
@@ -153,6 +142,131 @@ final class ToolItem extends ChatItem {
 }
 
 enum _Status { idle, listening, processing, speaking, error }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// _AudioStreamer — encapsulates all raw-PCM playback logic
+//
+// Industry pattern: feed raw PCM frames directly to the native audio engine
+// via a callback-driven ring-buffer.  flutter_pcm_sound exposes exactly this:
+//   • FlutterPcmSound.setup()  — initialise native audio session once
+//   • FlutterPcmSound.feed()   — push an Int16List frame into the ring-buffer
+//   • onFeedSamplesCallback    — fires when the buffer is running low so we
+//                                can feed the next chunk proactively (pull model)
+//
+// This eliminates every source of gap in the old approach:
+//   ✗ No temp-file write per chunk
+//   ✗ No just_audio cold-start per chunk
+//   ✗ No 40 ms polling sleep
+//   ✓ Continuous native audio output — OS mixer handles timing
+// ════════════════════════════════════════════════════════════════════════════════
+
+class _AudioStreamer {
+  _AudioStreamer({required this.onPlaybackStarted, required this.onPlaybackStopped});
+
+  final VoidCallback onPlaybackStarted;
+  final VoidCallback onPlaybackStopped;
+
+  // Pending PCM chunks waiting to be fed into the native buffer.
+  final List<Uint8List> _pending = [];
+
+  bool _isSetup   = false;
+  bool _isPlaying = false;
+
+  /// Whether the server has signalled that this turn is complete.
+  bool turnDone = false;
+
+  bool get isPlaying => _isPlaying;
+
+  // ── Initialise the native audio session (call once) ─────────────────────────
+  Future<void> setup() async {
+    if (_isSetup) return;
+    await FlutterPcmSound.setup(
+      sampleRate: _kOutputSampleRate,
+      channelCount: 1,
+    );
+    // The feed threshold determines how many samples remain in the native
+    // buffer before onFeedSamplesCallback fires.  At 24 kHz mono, 6 000
+    // samples ≈ 250 ms of audio — enough headroom to feed the next chunk
+    // without risking underrun, without over-buffering.
+    FlutterPcmSound.setFeedThreshold(
+      _kOutputSampleRate ~/ 4, // 6 000 samples ≈ 250 ms
+    );
+    FlutterPcmSound.setFeedCallback(_onFeedNeeded);
+    _isSetup = true;
+  }
+
+  // ── Receive a new raw PCM chunk from the WebSocket ───────────────────────────
+  void pushChunk(Uint8List pcmBytes) {
+    _pending.add(pcmBytes);
+    if (!_isPlaying) _startPlaying();
+  }
+
+  // ── Begin playback — feeds the first chunk to kick off the native session ────
+  Future<void> _startPlaying() async {
+    if (_isPlaying) return;
+    await setup();
+    _isPlaying = true;
+    onPlaybackStarted();
+    await FlutterPcmSound.start();
+    _feedNext();
+  }
+
+  // ── Called by the native engine when the buffer needs more data ──────────────
+  // This is the pull-model callback — we push the next pending chunk here.
+  void _onFeedNeeded(int remainingSamples) {
+    _feedNext();
+  }
+
+  // ── Push the next pending chunk into the native buffer ───────────────────────
+  void _feedNext() {
+    if (_pending.isEmpty) {
+      // Buffer is empty.  If the turn is done, stop playback cleanly.
+      // If not, leave the native session running — more chunks are on the way.
+      if (turnDone) {
+        _stopPlayback();
+      }
+      return;
+    }
+
+    final chunk = _pending.removeAt(0);
+    // Interpret raw bytes as little-endian 16-bit signed PCM samples.
+    final bd = ByteData.sublistView(chunk);
+    final samples = List<int>.generate(
+      chunk.lengthInBytes ~/ 2,
+          (i) => bd.getInt16(i * 2, Endian.little),
+    );
+    FlutterPcmSound.feed(PcmArrayInt16.fromList(samples));
+  }
+
+  // ── Gracefully stop after the last chunk has been consumed ──────────────────
+  // flutter_pcm_sound has no stop() — playback ends naturally when the buffer
+  // drains and we stop feeding.  We call release() to tear down the native
+  // audio session so it can be re-setup cleanly on the next turn.
+  Future<void> _stopPlayback() async {
+    if (!_isPlaying) return;
+    _isPlaying = false;
+    turnDone   = false;
+    _isSetup   = false;          // force re-setup on next turn
+    await FlutterPcmSound.release();
+    onPlaybackStopped();
+  }
+
+  // ── Hard stop — called on interrupt or disconnect ────────────────────────────
+  Future<void> stopImmediately() async {
+    _pending.clear();
+    turnDone = false;
+    if (_isPlaying) {
+      _isPlaying = false;
+      _isSetup   = false;
+      await FlutterPcmSound.release();
+      onPlaybackStopped();
+    }
+  }
+
+  void dispose() {
+    stopImmediately();
+  }
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // Chat page — state
@@ -173,20 +287,21 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   WebSocketChannel?            _textCh;
   StreamSubscription<dynamic>? _textSub;
 
+  // Exponential back-off state for reconnects (caps at 16 s).
+  int _voiceBackoffSec = 1;
+  int _textBackoffSec  = 1;
+
   // ── Recording ───────────────────────────────────────────────────────────────
   final AudioRecorder _recorder    = AudioRecorder();
   bool                _isRecording = false;
 
-  // ── Playback ────────────────────────────────────────────────────────────────
-  final AudioPlayer     _player   = AudioPlayer();
-  final List<Uint8List> _pcmQueue = [];
-  bool _isPlaying = false;
+  // ── Playback ─────────────────────────────────────────────────────────────────
+  late final _AudioStreamer _streamer = _AudioStreamer(
+    onPlaybackStarted:  () => _setStatus(_Status.speaking),
+    onPlaybackStopped:  _onTurnFinished,
+  );
 
-  /// Set true when backend sends "done". The drain loop uses this to exit
-  /// cleanly once the queue is empty — mirrors the HTML drainAudioQueue logic.
-  bool _turnDone = false;
-
-  /// Tool cards that arrived during a turn — rendered after audio drains.
+  /// Tool cards buffered during a turn — inserted into the list after audio ends.
   final List<ToolItem> _pendingTools = [];
 
   // ── Text input ──────────────────────────────────────────────────────────────
@@ -194,20 +309,17 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   final FocusNode             _textFocus = FocusNode();
   bool _isTextMode = false;
 
-  // ── UI state ────────────────────────────────────────────────────────────────
+  // ── UI state ─────────────────────────────────────────────────────────────────
   _Status _status = _Status.idle;
 
   final List<ChatItem>   _items  = [];
   final ScrollController _scroll = ScrollController();
 
-  // Streaming Gemini transcript — index of the currently-live assistant bubble.
   int?   _streamingBubbleIdx;
   String _streamingText = '';
+  int?   _voicePlaceholderIdx;
 
-  // Index of the user voice placeholder bubble (replaced by user_transcript).
-  int? _voicePlaceholderIdx;
-
-  // ── Mic pulse animation ─────────────────────────────────────────────────────
+  // ── Mic pulse animation ──────────────────────────────────────────────────────
   late final AnimationController _pulseCtrl = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 850),
@@ -218,11 +330,12 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
   );
 
-  // ── Lifecycle ───────────────────────────────────────────────────────────────
+  // ── Lifecycle ────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
+    _streamer.setup(); // warm-up the native audio session early
     _connectVoice();
     _connectText();
   }
@@ -234,7 +347,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     _textSub?.cancel();
     _textCh?.sink.close();
     _recorder.dispose();
-    _player.dispose();
+    _streamer.dispose();
     _pulseCtrl.dispose();
     _scroll.dispose();
     _textCtrl.dispose();
@@ -243,7 +356,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // WebSocket connections — auto-reconnect on close
+  // WebSocket connections — exponential back-off reconnect
   // ════════════════════════════════════════════════════════════════════════════
 
   void _connectVoice() {
@@ -251,11 +364,22 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       _voiceCh  = IOWebSocketChannel.connect(Uri.parse(_kVoiceUrl));
       _voiceSub = _voiceCh!.stream.listen(
         _onFrame,
-        onError: (_) => Future.delayed(const Duration(seconds: 2), _connectVoice),
-        onDone:  ()  => Future.delayed(const Duration(seconds: 2), _connectVoice),
+        onError: (_) {
+          final delay = _voiceBackoffSec;
+          _voiceBackoffSec = (_voiceBackoffSec * 2).clamp(1, 16);
+          Future.delayed(Duration(seconds: delay), _connectVoice);
+        },
+        onDone: () {
+          final delay = _voiceBackoffSec;
+          _voiceBackoffSec = (_voiceBackoffSec * 2).clamp(1, 16);
+          Future.delayed(Duration(seconds: delay), _connectVoice);
+        },
       );
+      _voiceBackoffSec = 1; // reset on success
     } catch (_) {
-      Future.delayed(const Duration(seconds: 2), _connectVoice);
+      final delay = _voiceBackoffSec;
+      _voiceBackoffSec = (_voiceBackoffSec * 2).clamp(1, 16);
+      Future.delayed(Duration(seconds: delay), _connectVoice);
     }
   }
 
@@ -264,25 +388,34 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       _textCh  = IOWebSocketChannel.connect(Uri.parse(_kTextUrl));
       _textSub = _textCh!.stream.listen(
         _onFrame,
-        onError: (_) => Future.delayed(const Duration(seconds: 2), _connectText),
-        onDone:  ()  => Future.delayed(const Duration(seconds: 2), _connectText),
+        onError: (_) {
+          final delay = _textBackoffSec;
+          _textBackoffSec = (_textBackoffSec * 2).clamp(1, 16);
+          Future.delayed(Duration(seconds: delay), _connectText);
+        },
+        onDone: () {
+          final delay = _textBackoffSec;
+          _textBackoffSec = (_textBackoffSec * 2).clamp(1, 16);
+          Future.delayed(Duration(seconds: delay), _connectText);
+        },
       );
+      _textBackoffSec = 1;
     } catch (_) {
-      Future.delayed(const Duration(seconds: 2), _connectText);
+      final delay = _textBackoffSec;
+      _textBackoffSec = (_textBackoffSec * 2).clamp(1, 16);
+      Future.delayed(Duration(seconds: delay), _connectText);
     }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
   // Frame dispatcher — shared by both channels
-  // Binary  → raw PCM audio chunk
-  // String  → JSON, dispatched on type / status
   // ════════════════════════════════════════════════════════════════════════════
 
   void _onFrame(dynamic raw) {
     // ── Binary = raw 24 kHz PCM audio ────────────────────────────────────────
+    // Push directly into the streamer — no file I/O, no intermediate queue.
     if (raw is List<int>) {
-      _pcmQueue.add(Uint8List.fromList(raw));
-      if (!_isPlaying) _drainQueue();
+      _streamer.pushChunk(Uint8List.fromList(raw));
       return;
     }
 
@@ -295,26 +428,21 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       return;
     }
 
-    // ── Typed frames (have a "type" field) ───────────────────────────────────
     final type = msg['type'] as String?;
     if (type != null) {
       switch (type) {
-
-      // Gemini's spoken words — stream incrementally into one bubble.
         case 'gemini_transcript':
           final chunk = (msg['text'] as String?) ?? '';
           if (chunk.isNotEmpty) _appendGeminiTranscript(chunk);
 
-      // User's recognised voice words — replace the placeholder bubble.
         case 'user_transcript':
           final text = (msg['text'] as String?) ?? '';
           if (text.isNotEmpty) _resolveVoicePlaceholder(text);
 
-      // A backend service was triggered — buffer until audio drains.
         case 'tool_call':
           _pendingTools.add(ToolItem(
             time:   DateTime.now(),
-            tool:   (msg['tool'] as String?) ?? '',
+            tool:   (msg['tool']   as String?) ?? '',
             args:   Map<String, dynamic>.from((msg['args']   as Map?) ?? {}),
             result: Map<String, dynamic>.from((msg['result'] as Map?) ?? {}),
           ));
@@ -322,7 +450,6 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       return;
     }
 
-    // ── Status frames (have a "status" field) ─────────────────────────────────
     switch (msg['status'] as String?) {
 
       case 'ready':
@@ -331,21 +458,22 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
         }
 
       case 'processing':
-      // Reset streaming transcript state for the new turn.
         _streamingBubbleIdx = null;
         _streamingText      = '';
         _setStatus(_Status.processing);
 
       case 'done':
-      // Signal the drain loop to exit once the queue empties.
-        _turnDone = true;
-        // If no audio was queued at all, finalise immediately.
-        if (!_isPlaying && _pcmQueue.isEmpty) _onTurnFinished();
+      // Signal the streamer: once its buffer drains, call _onTurnFinished.
+        _streamer.turnDone = true;
+        // Edge case: if no audio chunks arrived at all, finish immediately.
+        if (!_streamer.isPlaying && _streamer.turnDone) {
+          _streamer.turnDone = false;
+          _onTurnFinished();
+        }
 
       case 'interrupted':
-        _pcmQueue.clear();
         _pendingTools.clear();
-        _turnDone = false;
+        _streamer.stopImmediately();
         _setStatus(_Status.idle);
 
       case 'error':
@@ -361,7 +489,6 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
   // ════════════════════════════════════════════════════════════════════════════
   // Gemini transcript streaming
-  // First chunk creates the bubble; subsequent chunks update it in place.
   // ════════════════════════════════════════════════════════════════════════════
 
   void _appendGeminiTranscript(String chunk) {
@@ -386,7 +513,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // User voice placeholder → real transcript
+  // Voice placeholder → real transcript
   // ════════════════════════════════════════════════════════════════════════════
 
   void _addVoicePlaceholder() {
@@ -416,61 +543,9 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // Audio — PCM queue drain
-  //
-  // Design mirrors the HTML client's drainAudioQueue():
-  //   • Keep going while there are chunks OR the turn is not yet done.
-  //   • 200 ms idle timeout guards against the queue momentarily emptying
-  //     while in-flight WebSocket frames are still on the way.
-  //   • Each chunk is wrapped in a WAV header so just_audio can decode it.
-  //   • After draining, call _onTurnFinished() to render tool cards.
+  // Turn finished — called by _AudioStreamer once the buffer is fully drained
   // ════════════════════════════════════════════════════════════════════════════
 
-  Future<void> _drainQueue() async {
-    if (_isPlaying) return;
-    _isPlaying = true;
-    _setStatus(_Status.speaking);
-
-    final dir  = await getTemporaryDirectory();
-    int idleMs = 0;
-
-    while (true) {
-      if (_pcmQueue.isNotEmpty) {
-        idleMs = 0;
-        final pcm  = _pcmQueue.removeAt(0);
-        final wav  = _wrapInWav(pcm);
-        final path =
-            '${dir.path}/md_${DateTime.now().microsecondsSinceEpoch}.wav';
-        await File(path).writeAsBytes(wav);
-
-        try {
-          await _player.setFilePath(path);
-          await _player.play();
-          // Block until this chunk finishes playing.
-          await _player.processingStateStream.firstWhere(
-                (s) =>
-            s == ProcessingState.completed ||
-                s == ProcessingState.idle,
-          );
-          await _player.stop();
-        } catch (_) {
-          // Skip a corrupt/empty chunk and continue.
-        }
-      } else {
-        // Queue empty — wait briefly for possible late-arriving frames.
-        await Future<void>.delayed(const Duration(milliseconds: 40));
-        idleMs += 40;
-        if (_turnDone || idleMs >= 200) break;
-      }
-    }
-
-    _isPlaying = false;
-    _turnDone  = false;
-    _onTurnFinished();
-  }
-
-  /// Called once audio has fully drained (or immediately if no audio came).
-  /// Renders any buffered tool cards and resets status to idle.
   void _onTurnFinished() {
     if (!mounted) return;
     if (_pendingTools.isNotEmpty) {
@@ -483,41 +558,6 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     _streamingBubbleIdx = null;
     _streamingText      = '';
     _setStatus(_Status.idle);
-  }
-
-  /// Wraps raw 16-bit mono PCM in a minimal 44-byte WAV header.
-  Uint8List _wrapInWav(Uint8List pcm, {int sampleRate = 24000}) {
-    const int channels      = 1;
-    const int bitsPerSample = 16;
-    final int byteRate      = sampleRate * channels * bitsPerSample ~/ 8;
-    final int blockAlign    = channels * bitsPerSample ~/ 8;
-    final int dataSize      = pcm.length;
-
-    final hdr = ByteData(44);
-    void str(int off, String s) {
-      for (var i = 0; i < s.length; i++) {
-        hdr.setUint8(off + i, s.codeUnitAt(i));
-      }
-    }
-
-    str(0,  'RIFF');
-    hdr.setUint32( 4, 36 + dataSize, Endian.little);
-    str(8,  'WAVE');
-    str(12, 'fmt ');
-    hdr.setUint32(16, 16,            Endian.little); // subchunk size
-    hdr.setUint16(20, 1,             Endian.little); // PCM format
-    hdr.setUint16(22, channels,      Endian.little);
-    hdr.setUint32(24, sampleRate,    Endian.little);
-    hdr.setUint32(28, byteRate,      Endian.little);
-    hdr.setUint16(32, blockAlign,    Endian.little);
-    hdr.setUint16(34, bitsPerSample, Endian.little);
-    str(36, 'data');
-    hdr.setUint32(40, dataSize,      Endian.little);
-
-    final out = Uint8List(44 + dataSize);
-    out.setAll(0,  hdr.buffer.asUint8List());
-    out.setAll(44, pcm);
-    return out;
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -539,13 +579,12 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       return;
     }
 
-    final dir  = await getTemporaryDirectory();
-    final path = '${dir.path}/mydrive_voice.pcm';
+    final path = '${Directory.systemTemp.path}/mydrive_voice.pcm';
 
     await _recorder.start(
       const RecordConfig(
         encoder:     AudioEncoder.pcm16bits,
-        sampleRate:  16000,
+        sampleRate:  _kInputSampleRate,
         numChannels: 1,
       ),
       path: path,
@@ -571,15 +610,11 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     final bytes = await file.readAsBytes();
     if (bytes.isEmpty) return;
 
-    // Add placeholder bubble; will be replaced when user_transcript arrives.
     _addVoicePlaceholder();
 
-    // Reset turn state before sending so a fresh turn can be tracked.
     _streamingBubbleIdx = null;
     _streamingText      = '';
-    _turnDone           = false;
 
-    // Send raw PCM then the control word.
     _voiceCh!.sink.add(bytes);
     _voiceCh!.sink.add('END_OF_SPEECH');
     _setStatus(_Status.processing);
@@ -612,10 +647,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       text:  text,
     ));
 
-    // Reset turn state before sending.
     _streamingBubbleIdx = null;
     _streamingText      = '';
-    _turnDone           = false;
 
     _textCh!.sink.add(jsonEncode({'type': 'message', 'text': text}));
     _setStatus(_Status.processing);
@@ -706,14 +739,14 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(Icons.record_voice_over_rounded,
-                size: 56, color: cs.onSurface.withOpacity(0.08)),
+                size: 56, color: cs.onSurface.withValues(alpha: 0.08)),
             const SizedBox(height: 14),
             Text(
               _isTextMode
                   ? 'Type a message below to start'
                   : 'Hold the mic to speak',
               style: TextStyle(
-                  color: cs.onSurface.withOpacity(0.25), fontSize: 14),
+                  color: cs.onSurface.withValues(alpha: 0.25), fontSize: 14),
             ),
           ],
         ),
@@ -741,7 +774,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     decoration: BoxDecoration(
       color: const Color(0xFF111118),
       border: Border(
-          top: BorderSide(color: cs.outlineVariant.withOpacity(0.3))),
+          top: BorderSide(color: cs.outlineVariant.withValues(alpha: 0.3))),
     ),
     child: Column(
       mainAxisSize: MainAxisSize.min,
@@ -767,7 +800,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                     color: (_isRecording
                         ? const Color(0xFFFF4D6D)
                         : const Color(0xFF6C63FF))
-                        .withOpacity(0.48),
+                        .withValues(alpha: 0.48),
                     blurRadius: 24,
                     spreadRadius: 3,
                   ),
@@ -784,7 +817,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
         Text(
           _isRecording ? 'Release to send' : 'Hold to speak',
           style: TextStyle(
-              color: cs.onSurface.withOpacity(0.38), fontSize: 13),
+              color: cs.onSurface.withValues(alpha: 0.38), fontSize: 13),
         ),
       ],
     ),
@@ -804,7 +837,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       decoration: BoxDecoration(
         color: const Color(0xFF111118),
         border: Border(
-            top: BorderSide(color: cs.outlineVariant.withOpacity(0.3))),
+            top: BorderSide(color: cs.outlineVariant.withValues(alpha: 0.3))),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
@@ -819,7 +852,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
               style: const TextStyle(fontSize: 14.5, color: Colors.white),
               decoration: InputDecoration(
                 hintText:  'Type a message…',
-                hintStyle: TextStyle(color: cs.onSurface.withOpacity(0.35)),
+                hintStyle: TextStyle(color: cs.onSurface.withValues(alpha: 0.35)),
                 filled:    true,
                 fillColor: const Color(0xFF16161F),
                 contentPadding:
@@ -845,8 +878,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                   color: const Color(0xFF6C63FF),
                   boxShadow: [
                     BoxShadow(
-                      color:       const Color(0xFF6C63FF).withOpacity(0.42),
-                      blurRadius:  14,
+                      color:        const Color(0xFF6C63FF).withValues(alpha: 0.42),
+                      blurRadius:   14,
                       spreadRadius: 2,
                     ),
                   ],
@@ -943,7 +976,7 @@ class _AppBar extends StatelessWidget implements PreferredSizeWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// Status dots — thinking / speaking indicator
+// Status dots
 // ════════════════════════════════════════════════════════════════════════════════
 
 class _StatusDots extends StatelessWidget {
@@ -1024,7 +1057,6 @@ class _BubbleWidget extends StatelessWidget {
             crossAxisAlignment:
             isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
             children: [
-              // Bubble
               Container(
                 padding: const EdgeInsets.symmetric(
                     horizontal: 14, vertical: 10),
@@ -1034,7 +1066,7 @@ class _BubbleWidget extends StatelessWidget {
                       : const Color(0xFF131320),
                   border: Border.all(
                     color: isUser
-                        ? const Color(0xFF6C63FF).withOpacity(0.25)
+                        ? const Color(0xFF6C63FF).withValues(alpha: 0.25)
                         : const Color(0xFF22222E),
                   ),
                   borderRadius: BorderRadius.only(
@@ -1051,14 +1083,13 @@ class _BubbleWidget extends StatelessWidget {
                     height:    1.5,
                     color: isUser
                         ? Colors.white
-                        : Colors.white.withOpacity(0.85),
+                        : Colors.white.withValues(alpha: 0.85),
                     fontStyle:
                     isUser ? FontStyle.normal : FontStyle.italic,
                   ),
                 ),
               ),
               const SizedBox(height: 3),
-              // Meta row
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -1147,7 +1178,7 @@ class _ToolCardWidget extends StatelessWidget {
           child: Container(
             decoration: BoxDecoration(
               color:  const Color(0xFF131320),
-              border: Border.all(color: color.withOpacity(0.32)),
+              border: Border.all(color: color.withValues(alpha: 0.32)),
               borderRadius: const BorderRadius.only(
                 topLeft:     Radius.circular(16),
                 topRight:    Radius.circular(16),
@@ -1158,9 +1189,7 @@ class _ToolCardWidget extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Header
                 _CardHeader(icon: icon, label: label, color: color),
-                // Body
                 Padding(
                   padding: const EdgeInsets.all(12),
                   child: Column(
@@ -1221,12 +1250,12 @@ class _CardHeader extends StatelessWidget {
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
     decoration: BoxDecoration(
-      color: color.withOpacity(0.07),
+      color: color.withValues(alpha: 0.07),
       borderRadius: const BorderRadius.only(
         topLeft:  Radius.circular(15),
         topRight: Radius.circular(15),
       ),
-      border: Border(bottom: BorderSide(color: color.withOpacity(0.18))),
+      border: Border(bottom: BorderSide(color: color.withValues(alpha: 0.18))),
     ),
     child: Row(
       children: [
@@ -1241,14 +1270,13 @@ class _CardHeader extends StatelessWidget {
                 letterSpacing: 0.3,
               )),
         ),
-        // "Triggered" badge
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
           decoration: BoxDecoration(
-            color:        const Color(0xFF00E5A0).withOpacity(0.10),
+            color:        const Color(0xFF00E5A0).withValues(alpha: 0.10),
             borderRadius: BorderRadius.circular(20),
             border: Border.all(
-                color: const Color(0xFF00E5A0).withOpacity(0.28)),
+                color: const Color(0xFF00E5A0).withValues(alpha: 0.28)),
           ),
           child: const Row(
             mainAxisSize: MainAxisSize.min,
