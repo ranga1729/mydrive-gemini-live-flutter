@@ -158,7 +158,7 @@ final class ToolItem extends ChatItem {
   });
 }
 
-enum _Status { idle, listening, processing, speaking, error }
+enum _Status { idle, micOpening, listening, processing, speaking, error }
 
 // ════════════════════════════════════════════════════════════════════════════════
 // _AudioStreamer — flutter_pcm_sound v3.3.3 "One-Pedal Driving"
@@ -337,17 +337,21 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   int?   _textStreamingIdx;
   String _textStreamingText = '';
 
-  // ── Tool cards (voice session only — shown after audio finishes) ─────────────
+  // ── Tracks which channel owns the current audio turn ─────────────────────────
+  // 'voice' | 'text' | null
+  String? _activeTurnChannel;
+
+  // ── Tool cards — buffered during a turn, shown after audio finishes ──────────
   final List<ToolItem> _pendingTools = [];
 
   // ── Recording ────────────────────────────────────────────────────────────────
   final AudioRecorder _recorder    = AudioRecorder();
   bool                _isRecording = false;
 
-  // ── Playback (voice channel only) ────────────────────────────────────────────
+  // ── Playback — shared by both channels ───────────────────────────────────────
   late final _AudioStreamer _streamer = _AudioStreamer(
     onPlaybackStarted: () => _setStatus(_Status.speaking),
-    onPlaybackStopped: _onVoiceTurnFinished,
+    onPlaybackStopped: _onTurnFinished,
   );
 
   // ── Watchdog ─────────────────────────────────────────────────────────────────
@@ -453,7 +457,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   void _startWatchdog() {
     _watchdog?.cancel();
     _watchdog = Timer(_kWatchdogTimeout, () {
-      if (_status == _Status.processing || _status == _Status.listening) {
+      if (_status == _Status.processing || _status == _Status.listening ||
+          _status == _Status.micOpening) {
         debugPrint('[watchdog] timeout');
         _streamer.stopImmediately();
         _streamer.prepareForNextTurn();
@@ -567,6 +572,17 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   // ════════════════════════════════════════════════════════════════════════════
 
   void _onTextFrame(dynamic raw) {
+    // ── Binary = raw 24 kHz PCM audio from the text session ──────────────────
+    // /ws/text uses response_modalities=["AUDIO"] and streams binary PCM
+    // frames identically to /ws/chat. Feed them into the shared streamer.
+    if (raw is List<int>) {
+      debugPrint('[text] binary audio chunk: ${raw.length} bytes');
+      _cancelWatchdog(); // first audio = backend alive
+      final bytes = raw is Uint8List ? raw : Uint8List.fromList(raw);
+      _streamer.pushChunk(bytes);
+      return;
+    }
+
     if (raw is! String) return;
 
     late final Map<String, dynamic> msg;
@@ -579,8 +595,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
           final chunk = (msg['text'] as String?) ?? '';
           if (chunk.isNotEmpty) _appendTextTranscript(chunk);
         case 'tool_call':
-        // Text-channel tool cards shown immediately (no audio gate needed).
-          _addItem(ToolItem(
+          _pendingTools.add(ToolItem(
             time:   DateTime.now(),
             tool:   (msg['tool']   as String?) ?? '',
             args:   Map<String, dynamic>.from((msg['args']   as Map?) ?? {}),
@@ -603,12 +618,22 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
       case 'done':
         _cancelWatchdog();
-        _textStreamingIdx  = null;
-        _textStreamingText = '';
-        _setStatus(_Status.idle);
+        debugPrint('[text] done received — isPlaying=${_streamer.isPlaying}');
+        _streamer.turnDone = true;
+        if (!_streamer.isPlaying) {
+          // No audio chunks arrived (text-only response or all arrived before
+          // _startPlaying was called). Finish the turn immediately.
+          _streamer.turnDone = false;
+          _onTextTurnFinished();
+        }
+    // If isPlaying==true, the streamer drains naturally and fires
+    // _onTurnFinished() → _onTextTurnFinished() via _activeTurnChannel.
 
       case 'interrupted':
         _cancelWatchdog();
+        _pendingTools.clear();
+        _streamer.stopImmediately();
+        _streamer.prepareForNextTurn();
         _textStreamingIdx  = null;
         _textStreamingText = '';
         _setStatus(_Status.idle);
@@ -621,6 +646,23 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
           text: '❌ ${(msg['message'] as String?) ?? 'Unknown error'}',
         ));
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Text turn finished (mirrors _onVoiceTurnFinished, called by streamer)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  void _onTextTurnFinished() {
+    if (!mounted) return;
+    _cancelWatchdog();
+    _streamer.prepareForNextTurn();
+    if (_pendingTools.isNotEmpty) {
+      setState(() { _items.addAll(_pendingTools); _pendingTools.clear(); });
+      _scrollToBottom();
+    }
+    _textStreamingIdx  = null;
+    _textStreamingText = '';
+    _setStatus(_Status.idle);
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -692,6 +734,20 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Turn finished dispatcher — called by _AudioStreamer.onPlaybackStopped
+  // Routes to the correct channel's cleanup based on who owns the turn.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  void _onTurnFinished() {
+    if (_activeTurnChannel == 'text') {
+      _onTextTurnFinished();
+    } else {
+      _onVoiceTurnFinished();
+    }
+    _activeTurnChannel = null;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Voice turn finished
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -724,6 +780,14 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
       return;
     }
 
+    // Show a "mic opening" state immediately so the user knows to wait a beat
+    // before speaking. The OS audio session takes ~200–500 ms to open on
+    // Android/iOS. If the user speaks before start() resolves, that audio is
+    // lost. We set _isRecording = false here and only flip it to true AFTER
+    // start() fully completes, so _stopRecording() is a no-op if the user
+    // releases the button before the session is ready.
+    if (mounted) setState(() { _status = _Status.micOpening; });
+
     final path =
         '${Directory.systemTemp.path}/mydrive_${DateTime.now().millisecondsSinceEpoch}.wav';
     try {
@@ -735,9 +799,11 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
         ),
         path: path,
       );
+      // Audio session is now confirmed open. ONLY NOW set the listening state.
       if (mounted) setState(() { _isRecording = true; _status = _Status.listening; });
     } catch (e) {
       debugPrint('[_startRecording] $e');
+      if (mounted) _setStatus(_Status.idle);
       _addItem(BubbleItem(
         time: DateTime.now(), role: _Role.assistant,
         text: '⚠️ Could not start recording: $e',
@@ -758,6 +824,17 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
     final file = File(path);
     if (!await file.exists())             { _setStatus(_Status.idle); return; }
+
+    // On Android/iOS the audio session may not have fully flushed the WAV to
+    // disk by the time recorder.stop() returns — especially on short recordings.
+    // Poll file size for up to 500 ms until it stabilises.
+    int prevSize = -1;
+    for (int i = 0; i < 10; i++) {
+      final size = await file.length().catchError((_) => 0);
+      if (size > 0 && size == prevSize) break;
+      prevSize = size;
+      await Future.delayed(const Duration(milliseconds: 50));
+    }
 
     final rawBytes = await file.readAsBytes();
     file.delete().ignore();
@@ -780,6 +857,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     try {
       _voiceCh!.sink.add(pcmBytes);
       _voiceCh!.sink.add('END_OF_SPEECH');
+      _activeTurnChannel = 'voice';
       _setStatus(_Status.processing);
       _startWatchdog(); // started exactly ONCE here
     } catch (e) {
@@ -815,6 +893,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
     try {
       _textCh!.sink.add(jsonEncode({'type': 'message', 'text': text}));
+      _activeTurnChannel = 'text';
       _setStatus(_Status.processing);
       _startWatchdog(); // started exactly ONCE here
     } catch (e) {
@@ -828,7 +907,9 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   // ════════════════════════════════════════════════════════════════════════════
 
   bool get _isBusy =>
-      _status == _Status.processing || _status == _Status.speaking;
+      _status == _Status.processing ||
+          _status == _Status.speaking   ||
+          _status == _Status.micOpening;
 
   void _setStatus(_Status s) {
     if (mounted) setState(() => _status = s);
@@ -854,6 +935,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
 
   String get _statusLabel => switch (_status) {
     _Status.idle       => 'Ready',
+    _Status.micOpening => 'Opening mic…',
     _Status.listening  => 'Listening…',
     _Status.processing => 'Thinking…',
     _Status.speaking   => 'Speaking…',
@@ -861,6 +943,7 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   };
 
   Color get _statusColor => switch (_status) {
+    _Status.micOpening => const Color(0xFF00B4D8),
     _Status.listening  => const Color(0xFF00E5A0),
     _Status.processing => const Color(0xFFFFB830),
     _Status.speaking   => const Color(0xFF6C63FF),
@@ -961,12 +1044,16 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
                 shape: BoxShape.circle,
                 color: _isBusy
                     ? const Color(0xFF2A2A38)
+                    : _status == _Status.micOpening
+                    ? const Color(0xFF00B4D8).withValues(alpha: 0.5)
                     : _isRecording
                     ? const Color(0xFFFF4D6D)
                     : const Color(0xFF6C63FF),
                 boxShadow: _isBusy ? [] : [
                   BoxShadow(
-                    color: (_isRecording
+                    color: (_status == _Status.micOpening
+                        ? const Color(0xFF00B4D8)
+                        : _isRecording
                         ? const Color(0xFFFF4D6D)
                         : const Color(0xFF6C63FF)).withValues(alpha: 0.48),
                     blurRadius: 24, spreadRadius: 3,
@@ -976,7 +1063,11 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
               child: Icon(
                 _isBusy
                     ? Icons.hourglass_empty_rounded
-                    : _isRecording ? Icons.stop_rounded : Icons.mic_rounded,
+                    : _status == _Status.micOpening
+                    ? Icons.mic_none_rounded   // hollow mic = not yet open
+                    : _isRecording
+                    ? Icons.stop_rounded
+                    : Icons.mic_rounded,
                 color: _isBusy ? const Color(0xFF5A5A72) : Colors.white,
                 size: 32,
               ),
@@ -987,6 +1078,8 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
         Text(
           _isBusy
               ? _statusLabel
+              : _status == _Status.micOpening
+              ? 'Opening mic…'
               : _isRecording ? 'Release to send' : 'Hold to speak',
           style: TextStyle(
               color: cs.onSurface.withValues(alpha: 0.38), fontSize: 13),
@@ -1135,7 +1228,8 @@ class _StatusDots extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final show = status == _Status.processing || status == _Status.speaking;
+    final show = status == _Status.processing || status == _Status.speaking ||
+        status == _Status.micOpening;
     return AnimatedSize(
       duration: const Duration(milliseconds: 200),
       child: show
@@ -1151,6 +1245,8 @@ class _StatusDots extends StatelessWidget {
             Text(
               status == _Status.processing
                   ? 'MyDrive AI is thinking…'
+                  : status == _Status.micOpening
+                  ? 'Opening microphone…'
                   : 'Speaking…',
               style: const TextStyle(color: Color(0xFF5A5A72), fontSize: 12),
             ),
