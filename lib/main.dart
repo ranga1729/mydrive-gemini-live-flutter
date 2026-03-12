@@ -1,931 +1,511 @@
-/// MyDrive — Flutter Voice + Text Client for Gemini Live FastAPI Backend
-///
-/// ── pubspec.yaml dependencies ────────────────────────────────────────────────
-/// dependencies:
-///   flutter:
-///     sdk: flutter
-///   record: ^6.2.0
-///   flutter_pcm_sound: ^3.3.3
-///   web_socket_channel: ^3.0.1
-///   permission_handler: ^12.0.1
-///
-/// ── Android — AndroidManifest.xml ────────────────────────────────────────────
-///   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
-///   <uses-permission android:name="android.permission.INTERNET"/>
-///
-/// ── iOS — Info.plist ──────────────────────────────────────────────────────────
-///   <key>NSMicrophoneUsageDescription</key>
-///   <string>MyDrive needs the microphone to send voice messages.</string>
-///
-/// ══════════════════════════════════════════════════════════════════════════════
-/// ROOT CAUSE ANALYSIS (from screenshot evidence)
-/// ══════════════════════════════════════════════════════════════════════════════
-///
-/// BUG 1 — CRITICAL: Shared _onFrame for both WebSocket channels
-///   Both /ws/chat (voice) and /ws/text (text) fed all frames into a single
-///   _onFrame() handler that mutated the same shared state (_streamingBubbleIdx,
-///   _streamingText, _streamer, _status, watchdog).
-///   A stale "ready" or "processing" frame from the idle text channel could
-///   arrive while voice was mid-turn and silently corrupt streaming state.
-///   Audio binary frames from voice cancelled the shared watchdog, which was
-///   also protecting the text channel.
-///   FIX: Split into _onVoiceFrame() and _onTextFrame(). Each channel has its
-///        own streaming state (_voiceStreamingIdx / _textStreamingIdx).
-///        Binary PCM is only accepted from the voice channel.
-///
-/// BUG 2 — Watchdog started twice per voice turn
-///   _stopRecording() called _startWatchdog(). Then the backend echoed
-///   {"status":"processing"} which hit _onFrame → _startWatchdog() again,
-///   resetting the 30 s clock and masking the real failure.
-///   FIX: Watchdog is started exactly ONCE per turn — in _stopRecording() or
-///        _sendText(). The backend echo of "processing" only updates the UI
-///        label; it never touches the watchdog.
-///
-/// BUG 3 — Fragile 44-byte WAV header strip
-///   The `record` package (pcm16bits) writes a standard WAV container, but
-///   optional metadata chunks (LIST, INFO, fact …) can push the "data" payload
-///   well beyond byte 44. Sending the wrong bytes to Gemini produces garbage
-///   transcription ("He" instead of "Hello") and the backend returns nothing.
-///   FIX: _extractPcmFromWav() walks the RIFF sub-chunk list to locate the
-///        "data" tag and returns exactly those bytes. Falls back to raw
-///        passthrough if the file is not a WAV.
-///
-/// BUG 4 — Watchdog fired while audio was actively playing
-///   The watchdog started at send-time was never extended by incoming audio
-///   chunks. A backend response with a long audio payload could be cut off
-///   by the 30 s wall mid-playback.
-///   FIX: First binary audio chunk from voice channel cancels the watchdog.
-///        The streamer being alive is proof the backend responded.
-
-library;
+// lib/main.dart
+// MyDrive Assistant — Flutter Client
+// ====================================
+// Architecture
+// ─────────────
+// Two WebSocket connections are maintained simultaneously, sharing the same
+// session_id so the backend routes both to the identical Gemini session:
+//
+//   /ws/chat?session_id=<id>  — voice channel
+//       Outbound : raw 16-bit PCM chunks (16 kHz mono) + "END_OF_SPEECH"
+//       Inbound  : binary PCM audio (24 kHz) + ALL JSON frames
+//
+//   /ws/text?session_id=<id>  — text channel
+//       Outbound : JSON {"type":"message","text":"..."}
+//       Inbound  : JSON frames ONLY (no binary audio)
+//
+// Because the backend now sends audio ONLY to voice subscribers, there is
+// NO frame duplication — each JSON frame is processed exactly once (via the
+// text channel listener), and audio is played from the voice channel.
+//
+// pubspec.yaml dependencies:
+//   record: ^6.2.0
+//   web_socket_channel: ^3.0.1
+//   permission_handler: ^12.0.1
+//   flutter_pcm_sound: ^3.3.3
+//   uuid: ^4.0.0
+//
+// Android AndroidManifest.xml:
+//   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+//   <uses-permission android:name="android.permission.INTERNET"/>
+//   <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+//
+// iOS Info.plist:
+//   NSMicrophoneUsageDescription → "MyDrive needs your microphone for voice commands."
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
-
 import 'package:flutter/material.dart';
-import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter/services.dart';
 import 'package:record/record.dart';
-import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
+import 'package:uuid/uuid.dart';
 
-// ════════════════════════════════════════════════════════════════════════════════
-// Configuration
-// ════════════════════════════════════════════════════════════════════════════════
+// ── Backend ────────────────────────────────────────────────────────────────────
+const String _kHost           = 'mydrive-gemini-live-cueufbg0avdtg3de.canadacentral-01.azurewebsites.net';
+const int    _kOutSampleRate  = 24000; // Gemini output: 24 kHz PCM
+const int    _kInSampleRate   = 16000; // Gemini input:  16 kHz PCM
+const int    _kFeedThreshold  = 4800;  // ~200 ms worth of frames at 24 kHz
 
-const String _kBaseHost =
-    'mydrive-gemini-live-cueufbg0avdtg3de.canadacentral-01.azurewebsites.net';
-const String _kVoiceUrl = 'wss://$_kBaseHost/ws/chat';
-const String _kTextUrl  = 'wss://$_kBaseHost/ws/text';
+// ── Palette ────────────────────────────────────────────────────────────────────
+const _kBg      = Color(0xFF0A0A0F);
+const _kSurface = Color(0xFF111118);
+const _kPanel   = Color(0xFF16161F);
+const _kBorder  = Color(0xFF22222E);
+const _kAccent  = Color(0xFF6C63FF);
+const _kAccent2 = Color(0xFFFF6B9D);
+const _kGreen   = Color(0xFF00E5A0);
+const _kAmber   = Color(0xFFFFB830);
+const _kRed     = Color(0xFFFF4D6D);
+const _kText    = Color(0xFFE8E8F0);
+const _kMuted   = Color(0xFF5A5A72);
+const _kUserBg  = Color(0xFF1E1B3A);
+const _kAiBg    = Color(0xFF131320);
 
-const int _kOutputSampleRate = 24000;
-const int _kInputSampleRate  = 16000;
+// ── Models ─────────────────────────────────────────────────────────────────────
+enum MessageRole { user, ai }
+enum MessageKind { text, voice, toolCall }
+enum AppStatus   { disconnected, connecting, ready, listening, processing, speaking, error }
 
-const Duration _kWatchdogTimeout = Duration(seconds: 30);
+class ChatMessage {
+  final String id;
+  final MessageRole role;
+  final MessageKind kind;
+  String text;
+  Map<String, dynamic>? toolData;
+  ChatMessage({
+    required this.id,
+    required this.role,
+    required this.kind,
+    required this.text,
+    this.toolData,
+  });
+}
 
-/// ~100 ms of 16-bit 16 kHz mono audio.
-const int _kMinRecordingBytes = 3200;
-
-// ════════════════════════════════════════════════════════════════════════════════
-// Entry point
-// ════════════════════════════════════════════════════════════════════════════════
-
-void main() => runApp(const MyDriveApp());
+// ── Entry point ────────────────────────────────────────────────────────────────
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.light,
+  ));
+  await FlutterPcmSound.setup(sampleRate: _kOutSampleRate, channelCount: 1);
+  await FlutterPcmSound.setFeedThreshold(_kFeedThreshold);
+  runApp(const MyDriveApp());
+}
 
 class MyDriveApp extends StatelessWidget {
   const MyDriveApp({super.key});
-
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    title: 'MyDrive Assistant',
-    debugShowCheckedModeBanner: false,
-    theme: _theme(),
-    home: const ChatPage(),
-  );
-
-  ThemeData _theme() => ThemeData(
-    useMaterial3: true,
-    brightness: Brightness.dark,
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: const Color(0xFF6C63FF),
-      brightness: Brightness.dark,
-    ).copyWith(
-      surface: const Color(0xFF0A0A0F),
-      surfaceContainerHigh: const Color(0xFF16161F),
-      surfaceContainerHighest: const Color(0xFF1E1B2E),
-    ),
-  );
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'MyDrive Assistant',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: _kBg,
+        colorScheme: const ColorScheme.dark(
+          primary: _kAccent,
+          secondary: _kAccent2,
+          surface: _kSurface,
+        ),
+        textTheme: const TextTheme(bodyMedium: TextStyle(color: _kText)),
+      ),
+      home: const ChatScreen(),
+    );
+  }
 }
 
-// ════════════════════════════════════════════════════════════════════════════════
-// Domain models
-// ════════════════════════════════════════════════════════════════════════════════
-
-enum _Role  { user, assistant }
-enum _Input { voice, text }
-
-sealed class ChatItem {
-  final DateTime time;
-  const ChatItem({required this.time});
+// ── Chat screen ────────────────────────────────────────────────────────────────
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({super.key});
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
 }
 
-final class BubbleItem extends ChatItem {
-  final _Role   role;
-  final _Input? input;
-  final String  text;
-  const BubbleItem({
-    required super.time,
-    required this.role,
-    required this.text,
-    this.input,
-  });
-  BubbleItem copyWith({String? text}) => BubbleItem(
-    time: time, role: role, input: input, text: text ?? this.text,
-  );
-}
+class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
-final class ToolItem extends ChatItem {
-  final String               tool;
-  final Map<String, dynamic> args;
-  final Map<String, dynamic> result;
-  const ToolItem({
-    required super.time,
-    required this.tool,
-    required this.args,
-    required this.result,
-  });
-}
+  // ── Session & messages ───────────────────────────────────────────────────────
+  String _sessionId = const Uuid().v4();
+  final List<ChatMessage> _messages = [];
+  AppStatus _status = AppStatus.disconnected;
+  bool _isRecording  = false;
+  bool _showThinking = false;
 
-enum _Status { idle, micOpening, listening, processing, speaking, error }
+  // ── Controllers ──────────────────────────────────────────────────────────────
+  final ScrollController      _scrollCtrl = ScrollController();
+  final TextEditingController _textCtrl   = TextEditingController();
+  final FocusNode             _textFocus  = FocusNode();
 
-// ════════════════════════════════════════════════════════════════════════════════
-// _AudioStreamer — flutter_pcm_sound v3.3.3 "One-Pedal Driving"
-//
-// Confirmed v3.3.3 API:
-//   FlutterPcmSound.setup(sampleRate, channelCount)
-//   FlutterPcmSound.setFeedThreshold(numSamples)
-//   FlutterPcmSound.setFeedCallback(fn)    ← static method, NOT a setter
-//   FlutterPcmSound.start()               ← convenience; triggers onFeed(0)
-//   FlutterPcmSound.feed(PcmArrayInt16)   ← playing = feeding
-//   FlutterPcmSound.release()             ← call only in dispose()
-//
-// PLAY = keep calling feed(). STOP = stop calling feed().
-// No play() / stop() methods exist on this class.
-// ════════════════════════════════════════════════════════════════════════════════
+  // ── WebSockets ───────────────────────────────────────────────────────────────
+  WebSocketChannel?   _voiceWs;
+  WebSocketChannel?   _textWs;
+  StreamSubscription? _voiceSub;
+  StreamSubscription? _textSub;
 
-class _AudioStreamer {
-  _AudioStreamer({
-    required this.onPlaybackStarted,
-    required this.onPlaybackStopped,
-  });
+  // ── Audio recording ──────────────────────────────────────────────────────────
+  final AudioRecorder _recorder = AudioRecorder();
+  StreamSubscription<Uint8List>? _recordSub;
 
-  final VoidCallback onPlaybackStarted;
-  final VoidCallback onPlaybackStopped;
-
-  final List<Uint8List> _pending = [];
-  bool _isSetup   = false;
+  // ── Audio playback ───────────────────────────────────────────────────────────
+  final List<Uint8List> _audioQueue = [];
   bool _isPlaying = false;
-  bool _stopped   = false;
-  bool turnDone   = false;
 
-  bool get isPlaying => _isPlaying;
+  // ── Transcript state ─────────────────────────────────────────────────────────
+  // IDs of the bubbles currently being built by streaming transcript chunks.
+  // Cleared on 'done' and on new chat so each turn starts fresh.
+  String? _pendingUserBubbleId;
+  String? _pendingAiBubbleId;
 
-  Future<void> setup() async {
-    if (_isSetup) return;
-    try {
-      await FlutterPcmSound.setup(
-        sampleRate: _kOutputSampleRate, channelCount: 1,
-      );
-      await FlutterPcmSound.setFeedThreshold(_kOutputSampleRate ~/ 4);
-      FlutterPcmSound.setFeedCallback(_onFeedNeeded);
-      _isSetup = true;
-    } catch (e) {
-      debugPrint('[_AudioStreamer.setup] $e');
-    }
-  }
+  // ── Mic animation ─────────────────────────────────────────────────────────────
+  late AnimationController _pulseCtrl;
+  late Animation<double>   _pulseAnim;
 
-  void pushChunk(Uint8List pcmBytes) {
-    if (_stopped) return;
-    _pending.add(pcmBytes);
-    if (!_isPlaying) _startPlaying();
-  }
-
-  Future<void> _startPlaying() async {
-    if (_isPlaying || _stopped) return;
-    await setup();
-    _isPlaying = true;
-    onPlaybackStarted();
-    try {
-      FlutterPcmSound.start();
-    } catch (e) {
-      debugPrint('[_AudioStreamer._startPlaying] $e');
-    }
-  }
-
-  void _onFeedNeeded(int remainingFrames) {
-    if (_stopped) {
-      if (_isPlaying) { _isPlaying = false; onPlaybackStopped(); }
-      return;
-    }
-    if (remainingFrames == 0 && _pending.isEmpty && turnDone) {
-      _isPlaying = false;
-      turnDone   = false;
-      onPlaybackStopped();
-      return;
-    }
-    _feedNext();
-  }
-
-  void _feedNext() {
-    if (_stopped || _pending.isEmpty) return;
-    final chunk = _pending.removeAt(0);
-    try {
-      final bd      = ByteData.sublistView(chunk);
-      final samples = List<int>.generate(
-        chunk.lengthInBytes ~/ 2,
-            (i) => bd.getInt16(i * 2, Endian.little),
-      );
-      FlutterPcmSound.feed(PcmArrayInt16.fromList(samples));
-    } catch (e) {
-      debugPrint('[_AudioStreamer._feedNext] $e');
-    }
-  }
-
-  void stopImmediately() {
-    _pending.clear();
-    turnDone = false;
-    _stopped = true;
-    if (_isPlaying) { _isPlaying = false; onPlaybackStopped(); }
-  }
-
-  void prepareForNextTurn() {
-    _stopped  = false;
-    _pending.clear();
-    turnDone  = false;
-  }
-
-  Future<void> dispose() async {
-    _pending.clear();
-    _stopped = true;
-    _isPlaying = false;
-    try { await FlutterPcmSound.release(); } catch (_) {}
-  }
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// WAV → raw PCM extractor
-//
-// The standard WAV container wraps raw PCM in RIFF chunks. The audio payload
-// lives in the "data" sub-chunk which is NOT always at byte offset 44 — optional
-// chunks (LIST, INFO, fact, etc.) can appear before it.
-// We walk sub-chunks to find "data" and return exactly those bytes.
-// ════════════════════════════════════════════════════════════════════════════════
-
-Uint8List _extractPcmFromWav(Uint8List bytes) {
-  if (bytes.length < 20) return bytes;
-  // Check for "RIFF" magic.
-  if (bytes[0] != 0x52 || bytes[1] != 0x49 ||
-      bytes[2] != 0x46 || bytes[3] != 0x46) {
-    return bytes; // not a WAV — assume raw PCM already
-  }
-  final bd     = ByteData.sublistView(bytes);
-  int   offset = 12; // skip "RIFF????WAVE"
-  while (offset + 8 <= bytes.length) {
-    final id   = String.fromCharCodes(bytes.sublist(offset, offset + 4));
-    final size = bd.getUint32(offset + 4, Endian.little);
-    if (id == 'data') {
-      final start = offset + 8;
-      final end   = (start + size).clamp(0, bytes.length);
-      return bytes.sublist(start, end);
-    }
-    offset += 8 + size + (size & 1); // sub-chunks are word-aligned
-  }
-  // "data" not found — last-resort fallback.
-  return bytes.length > 44 ? bytes.sublist(44) : bytes;
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// Chat page
-// ════════════════════════════════════════════════════════════════════════════════
-
-class ChatPage extends StatefulWidget {
-  const ChatPage({super.key});
-  @override
-  State<ChatPage> createState() => _ChatPageState();
-}
-
-class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
-
-  // ── Voice WebSocket (/ws/chat) ──────────────────────────────────────────────
-  WebSocketChannel?            _voiceCh;
-  StreamSubscription<dynamic>? _voiceSub;
-  int _voiceBackoffSec = 1;
-
-  // ── Text WebSocket (/ws/text) ───────────────────────────────────────────────
-  WebSocketChannel?            _textCh;
-  StreamSubscription<dynamic>? _textSub;
-  int _textBackoffSec = 1;
-
-  // ── Voice-channel streaming state ───────────────────────────────────────────
-  int?   _voiceStreamingIdx;
-  String _voiceStreamingText = '';
-  int?   _voicePlaceholderIdx;
-
-  // ── Text-channel streaming state ────────────────────────────────────────────
-  int?   _textStreamingIdx;
-  String _textStreamingText = '';
-
-  // ── Tracks which channel owns the current audio turn ─────────────────────────
-  // 'voice' | 'text' | null
-  String? _activeTurnChannel;
-
-  // ── Tool cards — buffered during a turn, shown after audio finishes ──────────
-  final List<ToolItem> _pendingTools = [];
-
-  // ── Recording ────────────────────────────────────────────────────────────────
-  final AudioRecorder _recorder    = AudioRecorder();
-  bool                _isRecording = false;
-
-  // ── Playback — shared by both channels ───────────────────────────────────────
-  late final _AudioStreamer _streamer = _AudioStreamer(
-    onPlaybackStarted: () => _setStatus(_Status.speaking),
-    onPlaybackStopped: _onTurnFinished,
-  );
-
-  // ── Watchdog ─────────────────────────────────────────────────────────────────
-  Timer? _watchdog;
-
-  // ── UI state ─────────────────────────────────────────────────────────────────
-  bool                _isTextMode = false;
-  _Status             _status     = _Status.idle;
-  final List<ChatItem>   _items   = [];
-  final ScrollController _scroll  = ScrollController();
-
-  final TextEditingController _textCtrl  = TextEditingController();
-  final FocusNode             _textFocus = FocusNode();
-
-  late final AnimationController _pulseCtrl = AnimationController(
-    vsync: this, duration: const Duration(milliseconds: 850),
-  )..repeat(reverse: true);
-
-  late final Animation<double> _pulseAnim =
-  Tween<double>(begin: 1.0, end: 1.20).animate(
-    CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
-  );
-
-  late final AnimationController _dotsCtrl = AnimationController(
-    vsync: this, duration: const Duration(milliseconds: 1200),
-  )..repeat();
-
-  // ── Lifecycle ─────────────────────────────────────────────────────────────────
-
+  // ── Init / dispose ────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-    _streamer.setup();
-    _connectVoice();
-    _connectText();
+    _pulseCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 800));
+    _pulseAnim = Tween<double>(begin: 1.0, end: 1.18)
+        .animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
+    _pulseCtrl.stop();
+
+    FlutterPcmSound.setFeedCallback(_onPcmFeedRequest);
+    _connectAll();
   }
 
   @override
   void dispose() {
-    _watchdog?.cancel();
-    _voiceSub?.cancel();
-    _voiceCh?.sink.close();
-    _textSub?.cancel();
-    _textCh?.sink.close();
-    _recorder.dispose();
-    _streamer.dispose();
     _pulseCtrl.dispose();
-    _dotsCtrl.dispose();
-    _scroll.dispose();
+    _scrollCtrl.dispose();
     _textCtrl.dispose();
     _textFocus.dispose();
+    _disconnectAll();
+    _recorder.dispose();
+    FlutterPcmSound.release();
     super.dispose();
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // WebSocket connections
-  // ════════════════════════════════════════════════════════════════════════════
+  // ── Connection ────────────────────────────────────────────────────────────────
 
-  void _connectVoice() {
-    try {
-      _voiceSub?.cancel();
-      _voiceCh = IOWebSocketChannel.connect(Uri.parse(_kVoiceUrl));
-      _voiceSub = _voiceCh!.stream.listen(
-        _onVoiceFrame,
-        onError: (_) => _scheduleVoiceReconnect(),
-        onDone:  ()  => _scheduleVoiceReconnect(),
-      );
-    } catch (_) {
-      _scheduleVoiceReconnect();
-    }
+  void _connectAll() {
+    _setStatus(AppStatus.connecting);
+    _connectVoice();
+    _connectText();
   }
 
-  void _scheduleVoiceReconnect() {
-    final d = _voiceBackoffSec;
-    _voiceBackoffSec = (_voiceBackoffSec * 2).clamp(1, 16);
-    Future.delayed(Duration(seconds: d), _connectVoice);
+  void _connectVoice() {
+    _voiceSub?.cancel();
+    _voiceWs?.sink.close();
+    final uri = Uri.parse('wss://$_kHost/ws/chat?session_id=$_sessionId');
+    _voiceWs = WebSocketChannel.connect(uri);
+    _voiceSub = _voiceWs!.stream.listen(
+      _onVoiceFrame,
+      onDone:  () { if (mounted) _setStatus(AppStatus.disconnected); },
+      onError: (_) { if (mounted) _setStatus(AppStatus.error); },
+    );
   }
 
   void _connectText() {
-    try {
-      _textSub?.cancel();
-      _textCh = IOWebSocketChannel.connect(Uri.parse(_kTextUrl));
-      _textSub = _textCh!.stream.listen(
-        _onTextFrame,
-        onError: (_) => _scheduleTextReconnect(),
-        onDone:  ()  => _scheduleTextReconnect(),
-      );
-    } catch (_) {
-      _scheduleTextReconnect();
-    }
+    _textSub?.cancel();
+    _textWs?.sink.close();
+    final uri = Uri.parse('wss://$_kHost/ws/text?session_id=$_sessionId');
+    _textWs = WebSocketChannel.connect(uri);
+    _textSub = _textWs!.stream.listen(
+      _onTextFrame,
+      onDone:  () {},
+      onError: (_) { if (mounted) _setStatus(AppStatus.error); },
+    );
   }
 
-  void _scheduleTextReconnect() {
-    final d = _textBackoffSec;
-    _textBackoffSec = (_textBackoffSec * 2).clamp(1, 16);
-    Future.delayed(Duration(seconds: d), _connectText);
+  void _disconnectAll() {
+    _voiceSub?.cancel();
+    _textSub?.cancel();
+    _voiceWs?.sink.close();
+    _textWs?.sink.close();
+    _voiceWs = null;
+    _textWs  = null;
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // Watchdog — started exactly ONCE per turn, from the send site
-  // ════════════════════════════════════════════════════════════════════════════
-
-  void _startWatchdog() {
-    _watchdog?.cancel();
-    _watchdog = Timer(_kWatchdogTimeout, () {
-      if (_status == _Status.processing || _status == _Status.listening ||
-          _status == _Status.micOpening) {
-        debugPrint('[watchdog] timeout');
-        _streamer.stopImmediately();
-        _streamer.prepareForNextTurn();
-        _voiceStreamingIdx  = null;
-        _voiceStreamingText = '';
-        _textStreamingIdx   = null;
-        _textStreamingText  = '';
-        _setStatus(_Status.idle);
-        _addItem(BubbleItem(
-          time: DateTime.now(),
-          role: _Role.assistant,
-          text: '⚠️ Response timed out. Please try again.',
-        ));
-      }
-    });
-  }
-
-  void _cancelWatchdog() {
-    _watchdog?.cancel();
-    _watchdog = null;
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // VOICE channel frame handler  (/ws/chat)
+  // ── Incoming frame routing ────────────────────────────────────────────────────
   //
-  // Receives:
-  //   • List<int>                        — raw 24 kHz PCM audio
-  //   • {"status": "ready|processing|done|interrupted|error"}
-  //   • {"type": "gemini_transcript", "text": "..."}
-  //   • {"type": "user_transcript",   "text": "..."}
-  //   • {"type": "tool_call", "tool": "...", "args": {...}, "result": {...}}
-  // ════════════════════════════════════════════════════════════════════════════
+  // Voice channel → binary only (PCM audio to play)
+  // Text channel  → JSON only   (status, transcripts, tool calls)
+  //
+  // This is enforced by the backend (broadcast_audio vs broadcast_json).
+  // The client respects the same split: no JSON from voice, no audio from text.
 
   void _onVoiceFrame(dynamic raw) {
-    // ── Binary = raw PCM audio from Gemini ────────────────────────────────────
-    if (raw is List<int>) {
-      _cancelWatchdog(); // first audio = backend is alive, watchdog not needed
-      _streamer.pushChunk(Uint8List.fromList(raw));
-      return;
+    // The backend only sends binary PCM to voice subscribers.
+    // Any stray JSON (e.g. session_info on connect) is ignored intentionally.
+    if (raw is Uint8List) {
+      _enqueueAudio(raw);
+    } else if (raw is List<int>) {
+      _enqueueAudio(Uint8List.fromList(raw));
     }
-    if (raw is! String) return;
-
-    late final Map<String, dynamic> msg;
-    try { msg = jsonDecode(raw) as Map<String, dynamic>; } catch (_) { return; }
-
-    final type = msg['type'] as String?;
-    if (type != null) {
-      switch (type) {
-        case 'gemini_transcript':
-          final chunk = (msg['text'] as String?) ?? '';
-          if (chunk.isNotEmpty) _appendVoiceTranscript(chunk);
-        case 'user_transcript':
-          final t = (msg['text'] as String?) ?? '';
-          if (t.isNotEmpty) _resolveVoicePlaceholder(t);
-        case 'tool_call':
-          _pendingTools.add(ToolItem(
-            time:   DateTime.now(),
-            tool:   (msg['tool']   as String?) ?? '',
-            args:   Map<String, dynamic>.from((msg['args']   as Map?) ?? {}),
-            result: Map<String, dynamic>.from((msg['result'] as Map?) ?? {}),
-          ));
-      }
-      return;
-    }
-
-    switch (msg['status'] as String?) {
-      case 'ready':
-        _voiceBackoffSec = 1;
-        if (_status == _Status.error) _setStatus(_Status.idle);
-
-      case 'processing':
-      // Backend echo — only update the UI label.
-      // Watchdog was already started in _stopRecording(); do NOT restart it.
-        if (_status != _Status.processing) _setStatus(_Status.processing);
-
-      case 'done':
-        _cancelWatchdog();
-        _streamer.turnDone = true;
-        if (!_streamer.isPlaying) {
-          _streamer.turnDone = false;
-          _onVoiceTurnFinished();
-        }
-
-      case 'interrupted':
-        _cancelWatchdog();
-        _pendingTools.clear();
-        _streamer.stopImmediately();
-        _streamer.prepareForNextTurn();
-        _voiceStreamingIdx  = null;
-        _voiceStreamingText = '';
-        _setStatus(_Status.idle);
-
-      case 'error':
-        _cancelWatchdog();
-        _setStatus(_Status.error);
-        _addItem(BubbleItem(
-          time: DateTime.now(), role: _Role.assistant,
-          text: '❌ ${(msg['message'] as String?) ?? 'Unknown error'}',
-        ));
-    }
+    // String/JSON frames on the voice channel are intentionally ignored —
+    // the text channel listener handles all JSON.
   }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // TEXT channel frame handler  (/ws/text)
-  //
-  // Receives:
-  //   • {"status": "ready|processing|done|interrupted|error"}
-  //   • {"type": "gemini_transcript", "text": "..."}
-  //   • {"type": "tool_call", ...}
-  //   NOTE: text channel never sends binary or user_transcript.
-  // ════════════════════════════════════════════════════════════════════════════
 
   void _onTextFrame(dynamic raw) {
-    // ── Binary = raw 24 kHz PCM audio from the text session ──────────────────
-    // /ws/text uses response_modalities=["AUDIO"] and streams binary PCM
-    // frames identically to /ws/chat. Feed them into the shared streamer.
-    if (raw is List<int>) {
-      debugPrint('[text] binary audio chunk: ${raw.length} bytes');
-      _cancelWatchdog(); // first audio = backend alive
-      final bytes = raw is Uint8List ? raw : Uint8List.fromList(raw);
-      _streamer.pushChunk(bytes);
+    // The backend sends NO binary audio to text subscribers.
+    // Everything here is JSON.
+    if (raw is String) _handleJson(raw);
+  }
+
+  // ── JSON frame handler (called only from text channel) ────────────────────────
+
+  void _handleJson(String raw) {
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
       return;
     }
 
-    if (raw is! String) return;
+    final status = data['status'] as String?;
+    final type   = data['type']   as String?;
 
-    late final Map<String, dynamic> msg;
-    try { msg = jsonDecode(raw) as Map<String, dynamic>; } catch (_) { return; }
+    // ── Status frames ──────────────────────────────────────────────────────────
+    if (status != null) {
+      switch (status) {
+        case 'ready':
+          _setStatus(AppStatus.ready);
 
-    final type = msg['type'] as String?;
-    if (type != null) {
-      switch (type) {
-        case 'gemini_transcript':
-          final chunk = (msg['text'] as String?) ?? '';
-          if (chunk.isNotEmpty) _appendTextTranscript(chunk);
-        case 'tool_call':
-          _pendingTools.add(ToolItem(
-            time:   DateTime.now(),
-            tool:   (msg['tool']   as String?) ?? '',
-            args:   Map<String, dynamic>.from((msg['args']   as Map?) ?? {}),
-            result: Map<String, dynamic>.from((msg['result'] as Map?) ?? {}),
+        case 'processing':
+          _setStatus(AppStatus.processing);
+          if (!_showThinking) setState(() => _showThinking = true);
+
+        case 'done':
+        // Audio may still be playing; status becomes 'ready' once it drains
+          if (!_isPlaying) _setStatus(AppStatus.ready);
+          setState(() => _showThinking = false);
+          // Reset per-turn tracking so next turn creates fresh bubbles
+          _pendingUserBubbleId = null;
+          _pendingAiBubbleId   = null;
+
+        case 'error':
+          _setStatus(AppStatus.error);
+          _addMessage(ChatMessage(
+            id: _uuid(), role: MessageRole.ai, kind: MessageKind.text,
+            text: '⚠️ ${data['message'] ?? 'Unknown error'}',
           ));
-        default:
-          break;
+
+        case 'session_ended':
+          _setStatus(AppStatus.disconnected);
       }
       return;
     }
 
-    switch (msg['status'] as String?) {
-      case 'ready':
-        _textBackoffSec = 1;
-        if (_status == _Status.error) _setStatus(_Status.idle);
+    // ── Typed frames ───────────────────────────────────────────────────────────
+    switch (type) {
 
-      case 'processing':
-      // Backend echo — only update label. Watchdog started in _sendText().
-        if (_status != _Status.processing) _setStatus(_Status.processing);
-
-      case 'done':
-        _cancelWatchdog();
-        debugPrint('[text] done received — isPlaying=${_streamer.isPlaying}');
-        _streamer.turnDone = true;
-        if (!_streamer.isPlaying) {
-          // No audio chunks arrived (text-only response or all arrived before
-          // _startPlaying was called). Finish the turn immediately.
-          _streamer.turnDone = false;
-          _onTextTurnFinished();
+    // User voice transcript — arrives in chunks, append to same bubble
+      case 'user_transcript':
+        final chunk = (data['text'] as String? ?? '').trim();
+        if (chunk.isEmpty) return;
+        if (_pendingUserBubbleId != null) {
+          _appendToMessage(_pendingUserBubbleId!, ' $chunk');
+        } else {
+          final id = _uuid();
+          _pendingUserBubbleId = id;
+          _addMessage(ChatMessage(
+            id: id, role: MessageRole.user, kind: MessageKind.voice, text: chunk,
+          ));
         }
-    // If isPlaying==true, the streamer drains naturally and fires
-    // _onTurnFinished() → _onTextTurnFinished() via _activeTurnChannel.
 
-      case 'interrupted':
-        _cancelWatchdog();
-        _pendingTools.clear();
-        _streamer.stopImmediately();
-        _streamer.prepareForNextTurn();
-        _textStreamingIdx  = null;
-        _textStreamingText = '';
-        _setStatus(_Status.idle);
-
-      case 'error':
-        _cancelWatchdog();
-        _setStatus(_Status.error);
-        _addItem(BubbleItem(
-          time: DateTime.now(), role: _Role.assistant,
-          text: '❌ ${(msg['message'] as String?) ?? 'Unknown error'}',
-        ));
-    }
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // Text turn finished (mirrors _onVoiceTurnFinished, called by streamer)
-  // ════════════════════════════════════════════════════════════════════════════
-
-  void _onTextTurnFinished() {
-    if (!mounted) return;
-    _cancelWatchdog();
-    _streamer.prepareForNextTurn();
-    if (_pendingTools.isNotEmpty) {
-      setState(() { _items.addAll(_pendingTools); _pendingTools.clear(); });
-      _scrollToBottom();
-    }
-    _textStreamingIdx  = null;
-    _textStreamingText = '';
-    _setStatus(_Status.idle);
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // Transcript streaming helpers
-  // ════════════════════════════════════════════════════════════════════════════
-
-  void _appendVoiceTranscript(String chunk) {
-    _voiceStreamingText += chunk;
-    if (!mounted) return;
-    setState(() {
-      if (_voiceStreamingIdx == null) {
-        _voiceStreamingIdx = _items.length;
-        _items.add(BubbleItem(
-          time: DateTime.now(), role: _Role.assistant, text: _voiceStreamingText,
-        ));
-      } else {
-        final idx = _voiceStreamingIdx!;
-        if (idx < _items.length && _items[idx] is BubbleItem) {
-          _items[idx] = (_items[idx] as BubbleItem).copyWith(text: _voiceStreamingText);
+    // Gemini voice transcript — arrives in chunks, append to same bubble
+      case 'gemini_transcript':
+        final chunk = (data['text'] as String? ?? '').trim();
+        if (chunk.isEmpty) return;
+        setState(() => _showThinking = false);
+        if (_pendingAiBubbleId != null) {
+          _appendToMessage(_pendingAiBubbleId!, ' $chunk');
+        } else {
+          final id = _uuid();
+          _pendingAiBubbleId = id;
+          _addMessage(ChatMessage(
+            id: id, role: MessageRole.ai, kind: MessageKind.text, text: chunk,
+          ));
         }
-      }
-    });
-    _scrollToBottom();
-  }
 
-  void _appendTextTranscript(String chunk) {
-    _textStreamingText += chunk;
-    if (!mounted) return;
-    setState(() {
-      if (_textStreamingIdx == null) {
-        _textStreamingIdx = _items.length;
-        _items.add(BubbleItem(
-          time: DateTime.now(), role: _Role.assistant, text: _textStreamingText,
+    // Tool call card — one per tool invocation, no deduplication needed
+    // because the backend broadcasts each tool_call exactly once (broadcast_json)
+    // and only the text channel processes JSON.
+      case 'tool_call':
+        _addMessage(ChatMessage(
+          id: _uuid(),
+          role: MessageRole.ai,
+          kind: MessageKind.toolCall,
+          text: data['tool'] as String? ?? 'tool',
+          toolData: Map<String, dynamic>.from(data),
         ));
-      } else {
-        final idx = _textStreamingIdx!;
-        if (idx < _items.length && _items[idx] is BubbleItem) {
-          _items[idx] = (_items[idx] as BubbleItem).copyWith(text: _textStreamingText);
-        }
-      }
-    });
-    _scrollToBottom();
-  }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // Voice placeholder
-  // ════════════════════════════════════════════════════════════════════════════
-
-  void _addVoicePlaceholder() {
-    if (!mounted) return;
-    setState(() {
-      _voicePlaceholderIdx = _items.length;
-      _items.add(BubbleItem(
-        time: DateTime.now(), role: _Role.user,
-        input: _Input.voice, text: '🎙️ …',
-      ));
-    });
-    _scrollToBottom();
-  }
-
-  void _resolveVoicePlaceholder(String transcript) {
-    if (_voicePlaceholderIdx == null) return;
-    final idx = _voicePlaceholderIdx!;
-    _voicePlaceholderIdx = null;
-    if (!mounted || idx >= _items.length) return;
-    setState(() {
-      _items[idx] = (_items[idx] as BubbleItem).copyWith(text: '"$transcript"');
-    });
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // Turn finished dispatcher — called by _AudioStreamer.onPlaybackStopped
-  // Routes to the correct channel's cleanup based on who owns the turn.
-  // ════════════════════════════════════════════════════════════════════════════
-
-  void _onTurnFinished() {
-    if (_activeTurnChannel == 'text') {
-      _onTextTurnFinished();
-    } else {
-      _onVoiceTurnFinished();
+    // session_info — we own the session_id, nothing to do
+      case 'session_info':
+        break;
     }
-    _activeTurnChannel = null;
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // Voice turn finished
-  // ════════════════════════════════════════════════════════════════════════════
+  // ── PCM playback ──────────────────────────────────────────────────────────────
 
-  void _onVoiceTurnFinished() {
-    if (!mounted) return;
-    _cancelWatchdog();
-    _streamer.prepareForNextTurn();
-    if (_pendingTools.isNotEmpty) {
-      setState(() { _items.addAll(_pendingTools); _pendingTools.clear(); });
-      _scrollToBottom();
+  void _enqueueAudio(Uint8List pcm) {
+    _audioQueue.add(pcm);
+    if (!_isPlaying) _startPlayback();
+  }
+
+  void _startPlayback() {
+    if (_isPlaying || _audioQueue.isEmpty) return;
+    _isPlaying = true;
+    _setStatus(AppStatus.speaking);
+    _feedNext();
+  }
+
+  void _feedNext() {
+    if (_audioQueue.isEmpty) {
+      _isPlaying = false;
+      if (mounted && _status == AppStatus.speaking) _setStatus(AppStatus.ready);
+      return;
     }
-    _voiceStreamingIdx  = null;
-    _voiceStreamingText = '';
-    _setStatus(_Status.idle);
+    final chunk   = _audioQueue.removeAt(0);
+    final samples = _bytesToInt16(chunk);
+    FlutterPcmSound.feed(PcmArrayInt16.fromList(samples));
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // Voice recording
-  // ════════════════════════════════════════════════════════════════════════════
+  // Called by flutter_pcm_sound when its internal buffer needs more data
+  void _onPcmFeedRequest(int remainingFrames) {
+    if (remainingFrames == 0) _feedNext();
+  }
+
+  List<int> _bytesToInt16(Uint8List bytes) {
+    final bd = bytes.buffer.asByteData();
+    final out = <int>[];
+    for (var i = 0; i + 1 < bytes.length; i += 2) {
+      out.add(bd.getInt16(i, Endian.little));
+    }
+    return out;
+  }
+
+  // ── Voice recording ───────────────────────────────────────────────────────────
 
   Future<void> _startRecording() async {
-    if (_isBusy || _isRecording) return;
+    if (_isRecording) return;
 
     final perm = await Permission.microphone.request();
     if (!perm.isGranted) {
-      _addItem(BubbleItem(
-        time: DateTime.now(), role: _Role.assistant,
+      _addMessage(ChatMessage(
+        id: _uuid(), role: MessageRole.ai, kind: MessageKind.text,
         text: '⚠️ Microphone permission denied.',
       ));
       return;
     }
 
-    // Show a "mic opening" state immediately so the user knows to wait a beat
-    // before speaking. The OS audio session takes ~200–500 ms to open on
-    // Android/iOS. If the user speaks before start() resolves, that audio is
-    // lost. We set _isRecording = false here and only flip it to true AFTER
-    // start() fully completes, so _stopRecording() is a no-op if the user
-    // releases the button before the session is ready.
-    if (mounted) setState(() { _status = _Status.micOpening; });
+    if (_voiceWs == null) _connectVoice();
 
-    final path =
-        '${Directory.systemTemp.path}/mydrive_${DateTime.now().millisecondsSinceEpoch}.wav';
-    try {
-      await _recorder.start(
-        const RecordConfig(
-          encoder:     AudioEncoder.pcm16bits,
-          sampleRate:  _kInputSampleRate,
-          numChannels: 1,
-        ),
-        path: path,
-      );
-      // Audio session is now confirmed open. ONLY NOW set the listening state.
-      if (mounted) setState(() { _isRecording = true; _status = _Status.listening; });
-    } catch (e) {
-      debugPrint('[_startRecording] $e');
-      if (mounted) _setStatus(_Status.idle);
-      _addItem(BubbleItem(
-        time: DateTime.now(), role: _Role.assistant,
-        text: '⚠️ Could not start recording: $e',
-      ));
-    }
+    final stream = await _recorder.startStream(const RecordConfig(
+      encoder:     AudioEncoder.pcm16bits,
+      sampleRate:  _kInSampleRate,
+      numChannels: 1,
+      echoCancel:  true,
+      noiseSuppress: true,
+      autoGain:    true,
+    ));
+
+    _recordSub = stream.listen((chunk) => _voiceWs?.sink.add(chunk));
+
+    setState(() {
+      _isRecording  = true;
+      _showThinking = false;
+    });
+    _pulseCtrl.repeat(reverse: true);
+    _setStatus(AppStatus.listening);
   }
 
   Future<void> _stopRecording() async {
     if (!_isRecording) return;
 
-    String? path;
-    try { path = await _recorder.stop(); }
-    catch (e) { debugPrint('[_stopRecording] stop error: $e'); }
+    await _recordSub?.cancel();
+    _recordSub = null;
+    await _recorder.stop();
 
-    if (mounted) setState(() => _isRecording = false);
+    _voiceWs?.sink.add('END_OF_SPEECH');
 
-    if (path == null || _voiceCh == null) { _setStatus(_Status.idle); return; }
-
-    final file = File(path);
-    if (!await file.exists())             { _setStatus(_Status.idle); return; }
-
-    // On Android/iOS the audio session may not have fully flushed the WAV to
-    // disk by the time recorder.stop() returns — especially on short recordings.
-    // Poll file size for up to 500 ms until it stabilises.
-    int prevSize = -1;
-    for (int i = 0; i < 10; i++) {
-      final size = await file.length().catchError((_) => 0);
-      if (size > 0 && size == prevSize) break;
-      prevSize = size;
-      await Future.delayed(const Duration(milliseconds: 50));
-    }
-
-    final rawBytes = await file.readAsBytes();
-    file.delete().ignore();
-
-    if (rawBytes.isEmpty) { _setStatus(_Status.idle); return; }
-
-    // Properly walk RIFF sub-chunks to extract the raw PCM payload.
-    final Uint8List pcmBytes = _extractPcmFromWav(rawBytes);
-
-    if (pcmBytes.length < _kMinRecordingBytes) {
-      debugPrint('[_stopRecording] too short (${pcmBytes.length} B) — skip');
-      _setStatus(_Status.idle);
-      return;
-    }
-
-    _addVoicePlaceholder();
-    _voiceStreamingIdx  = null;
-    _voiceStreamingText = '';
-
-    try {
-      _voiceCh!.sink.add(pcmBytes);
-      _voiceCh!.sink.add('END_OF_SPEECH');
-      _activeTurnChannel = 'voice';
-      _setStatus(_Status.processing);
-      _startWatchdog(); // started exactly ONCE here
-    } catch (e) {
-      debugPrint('[_stopRecording] sink error: $e');
-      _setStatus(_Status.error);
-    }
+    setState(() {
+      _isRecording  = false;
+      _showThinking = true;
+    });
+    _pulseCtrl
+      ..stop()
+      ..reset();
+    _setStatus(AppStatus.processing);
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // Text sending
-  // ════════════════════════════════════════════════════════════════════════════
+  // ── Text sending ──────────────────────────────────────────────────────────────
 
   void _sendText() {
     final text = _textCtrl.text.trim();
     if (text.isEmpty) return;
+    if (_textWs == null) _connectText();
 
-    if (_textCh == null) {
-      _addItem(BubbleItem(
-        time: DateTime.now(), role: _Role.assistant,
-        text: '⚠️ Text channel not connected.',
-      ));
-      return;
-    }
+    // Show user bubble immediately — no transcript will arrive for text turns
+    _addMessage(ChatMessage(
+      id: _uuid(), role: MessageRole.user, kind: MessageKind.text, text: text,
+    ));
 
     _textCtrl.clear();
-    _textFocus.unfocus();
+    setState(() {
+      _showThinking    = true;
+      _pendingAiBubbleId = null; // next gemini_transcript chunk starts a new bubble
+    });
 
-    _addItem(BubbleItem(
-      time: DateTime.now(), role: _Role.user, input: _Input.text, text: text,
-    ));
-    _textStreamingIdx  = null;
-    _textStreamingText = '';
-
-    try {
-      _textCh!.sink.add(jsonEncode({'type': 'message', 'text': text}));
-      _activeTurnChannel = 'text';
-      _setStatus(_Status.processing);
-      _startWatchdog(); // started exactly ONCE here
-    } catch (e) {
-      debugPrint('[_sendText] sink error: $e');
-      _setStatus(_Status.error);
-    }
+    _textWs?.sink.add(jsonEncode({'type': 'message', 'text': text}));
+    _setStatus(AppStatus.processing);
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // Helpers
-  // ════════════════════════════════════════════════════════════════════════════
+  // ── New chat ──────────────────────────────────────────────────────────────────
 
-  bool get _isBusy =>
-      _status == _Status.processing ||
-          _status == _Status.speaking   ||
-          _status == _Status.micOpening;
+  void _newChat() {
+    _disconnectAll();
+    _audioQueue.clear();
+    _isPlaying = false;
 
-  void _setStatus(_Status s) {
-    if (mounted) setState(() => _status = s);
+    setState(() {
+      _sessionId           = const Uuid().v4();
+      _messages.clear();
+      _showThinking        = false;
+      _isRecording         = false;
+      _pendingUserBubbleId = null;
+      _pendingAiBubbleId   = null;
+    });
+
+    _connectAll();
   }
 
-  void _addItem(ChatItem item) {
-    if (!mounted) return;
-    setState(() => _items.add(item));
+  // ── Helpers ───────────────────────────────────────────────────────────────────
+
+  void _setStatus(AppStatus s) { if (mounted) setState(() => _status = s); }
+
+  void _addMessage(ChatMessage msg) {
+    setState(() => _messages.add(msg));
     _scrollToBottom();
+  }
+
+  /// Append a chunk of text to an existing bubble (streaming transcript).
+  void _appendToMessage(String id, String chunk) {
+    setState(() {
+      final idx = _messages.indexWhere((m) => m.id == id);
+      if (idx != -1) _messages[idx].text += chunk;
+    });
   }
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients && _scroll.positions.isNotEmpty) {
-        _scroll.animateTo(
-          _scroll.position.maxScrollExtent,
+      if (_scrollCtrl.hasClients) {
+        _scrollCtrl.animateTo(
+          _scrollCtrl.position.maxScrollExtent,
           duration: const Duration(milliseconds: 280),
           curve: Curves.easeOut,
         );
@@ -933,219 +513,317 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
     });
   }
 
-  String get _statusLabel => switch (_status) {
-    _Status.idle       => 'Ready',
-    _Status.micOpening => 'Opening mic…',
-    _Status.listening  => 'Listening…',
-    _Status.processing => 'Thinking…',
-    _Status.speaking   => 'Speaking…',
-    _Status.error      => 'Connection error',
+  String _uuid() => const Uuid().v4();
+
+  (String, Color) get _statusInfo => switch (_status) {
+    AppStatus.disconnected => ('Disconnected', _kMuted),
+    AppStatus.connecting   => ('Connecting…',  _kAmber),
+    AppStatus.ready        => ('Ready',         _kGreen),
+    AppStatus.listening    => ('Listening…',    _kAccent2),
+    AppStatus.processing   => ('Thinking…',     _kAmber),
+    AppStatus.speaking     => ('Speaking…',     _kAccent),
+    AppStatus.error        => ('Error',          _kRed),
   };
 
-  Color get _statusColor => switch (_status) {
-    _Status.micOpening => const Color(0xFF00B4D8),
-    _Status.listening  => const Color(0xFF00E5A0),
-    _Status.processing => const Color(0xFFFFB830),
-    _Status.speaking   => const Color(0xFF6C63FF),
-    _Status.error      => const Color(0xFFFF4D6D),
-    _Status.idle       => const Color(0xFF5A5A72),
-  };
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // Build
-  // ════════════════════════════════════════════════════════════════════════════
+  // ── Build ──────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
+    final (statusLabel, statusColor) = _statusInfo;
     return Scaffold(
-      backgroundColor: cs.surface,
-      resizeToAvoidBottomInset: true,
-      appBar: _AppBar(
-        statusLabel:  _statusLabel,
-        statusColor:  _statusColor,
-        isTextMode:   _isTextMode,
-        onModeToggle: (v) => setState(() {
-          _isTextMode = v;
-          if (v) {
-            Future.delayed(const Duration(milliseconds: 80), _textFocus.requestFocus);
-          } else {
-            _textFocus.unfocus();
-          }
-        }),
-      ),
-      body: Column(
-        children: [
-          Expanded(child: _buildList(cs)),
-          _StatusDots(status: _status, controller: _dotsCtrl),
-          _isTextMode ? _buildTextInput(cs) : _buildVoiceInput(cs),
-        ],
+      backgroundColor: _kBg,
+      body: SafeArea(
+        child: Column(children: [
+          _buildHeader(statusLabel, statusColor),
+          const Divider(color: _kBorder, height: 1, thickness: 1),
+          Expanded(child: _buildMessageList()),
+          const Divider(color: _kBorder, height: 1, thickness: 1),
+          _buildInputBar(),
+        ]),
       ),
     );
   }
 
-  Widget _buildList(ColorScheme cs) {
-    if (_items.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.record_voice_over_rounded,
-                size: 56, color: cs.onSurface.withValues(alpha: 0.08)),
-            const SizedBox(height: 14),
-            Text(
-              _isTextMode
-                  ? 'Type a message below to start'
-                  : 'Hold the mic to speak',
-              style: TextStyle(
-                  color: cs.onSurface.withValues(alpha: 0.25), fontSize: 14),
+  // ── Header ─────────────────────────────────────────────────────────────────────
+
+  Widget _buildHeader(String statusLabel, Color statusColor) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(children: [
+        // Logo
+        Container(
+          width: 40, height: 40,
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+              colors: [_kAccent, _kAccent2],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
             ),
-          ],
+            borderRadius: BorderRadius.circular(12),
+            boxShadow: [BoxShadow(color: _kAccent.withOpacity(0.35), blurRadius: 16)],
+          ),
+          child: const Center(child: Text('🚗', style: TextStyle(fontSize: 20))),
         ),
+        const SizedBox(width: 12),
+        // Title + status
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text(
+              'MyDrive Assistant',
+              style: TextStyle(color: _kText, fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: -0.3),
+            ),
+            const SizedBox(height: 3),
+            _StatusPill(label: statusLabel, color: statusColor),
+          ]),
+        ),
+        // New chat
+        TextButton(
+          onPressed: _newChat,
+          style: TextButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            backgroundColor: _kPanel,
+            side: const BorderSide(color: _kBorder),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          ),
+          child: const Text('New Chat',
+              style: TextStyle(color: _kMuted, fontSize: 12, fontWeight: FontWeight.w600)),
+        ),
+      ]),
+    );
+  }
+
+  // ── Message list ───────────────────────────────────────────────────────────────
+
+  Widget _buildMessageList() {
+    final count = _messages.length + (_showThinking ? 1 : 0);
+
+    if (count == 0) {
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 64, height: 64,
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [_kAccent, _kAccent2],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [BoxShadow(color: _kAccent.withOpacity(0.25), blurRadius: 24)],
+            ),
+            child: const Center(child: Text('🚗', style: TextStyle(fontSize: 32))),
+          ),
+          const SizedBox(height: 16),
+          const Text('MyDrive Assistant',
+              style: TextStyle(color: _kText, fontSize: 18, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          const Text('Hold mic to speak, or type a message',
+              style: TextStyle(color: _kMuted, fontSize: 13)),
+        ]),
       );
     }
+
     return ListView.builder(
-      controller: _scroll,
-      padding: const EdgeInsets.fromLTRB(12, 16, 12, 8),
-      itemCount: _items.length,
-      itemBuilder: (_, i) => switch (_items[i]) {
-        BubbleItem b => _BubbleWidget(bubble: b),
-        ToolItem   t => _ToolCardWidget(item: t),
+      controller: _scrollCtrl,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      itemCount: count,
+      itemBuilder: (context, i) {
+        if (_showThinking && i == count - 1) return const _ThinkingBubble();
+        return _MessageBubble(message: _messages[i]);
       },
     );
   }
 
-  Widget _buildVoiceInput(ColorScheme cs) => Container(
-    padding: EdgeInsets.only(
-      top: 20,
-      bottom: MediaQuery.of(context).padding.bottom + 24,
-    ),
-    decoration: BoxDecoration(
-      color: const Color(0xFF111118),
-      border: Border(
-          top: BorderSide(color: cs.outlineVariant.withValues(alpha: 0.3))),
-    ),
-    child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
+  // ── Input bar ──────────────────────────────────────────────────────────────────
+
+  Widget _buildInputBar() {
+    return Container(
+      color: _kSurface,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+
+        // Mic button (2)
         GestureDetector(
-          onLongPressStart: _isBusy ? null : (_) => _startRecording(),
-          onLongPressEnd:   _isBusy ? null : (_) => _stopRecording(),
+          onLongPressStart: (_) => _startRecording(),
+          onLongPressEnd:   (_) => _stopRecording(),
+          onTapDown:        (_) => _startRecording(),
+          onTapUp:          (_) => _stopRecording(),
           child: AnimatedBuilder(
             animation: _pulseAnim,
             builder: (_, child) => Transform.scale(
               scale: _isRecording ? _pulseAnim.value : 1.0,
               child: child,
             ),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              width: 72, height: 72,
+            child: Container(
+              width: 46, height: 46,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: _isBusy
-                    ? const Color(0xFF2A2A38)
-                    : _status == _Status.micOpening
-                    ? const Color(0xFF00B4D8).withValues(alpha: 0.5)
-                    : _isRecording
-                    ? const Color(0xFFFF4D6D)
-                    : const Color(0xFF6C63FF),
-                boxShadow: _isBusy ? [] : [
-                  BoxShadow(
-                    color: (_status == _Status.micOpening
-                        ? const Color(0xFF00B4D8)
-                        : _isRecording
-                        ? const Color(0xFFFF4D6D)
-                        : const Color(0xFF6C63FF)).withValues(alpha: 0.48),
-                    blurRadius: 24, spreadRadius: 3,
-                  ),
-                ],
+                color: _isRecording ? _kRed : _kAccent,
+                boxShadow: [BoxShadow(
+                  color: (_isRecording ? _kRed : _kAccent).withOpacity(0.4),
+                  blurRadius: _isRecording ? 20 : 10,
+                  spreadRadius: 1,
+                )],
               ),
               child: Icon(
-                _isBusy
-                    ? Icons.hourglass_empty_rounded
-                    : _status == _Status.micOpening
-                    ? Icons.mic_none_rounded   // hollow mic = not yet open
-                    : _isRecording
-                    ? Icons.stop_rounded
-                    : Icons.mic_rounded,
-                color: _isBusy ? const Color(0xFF5A5A72) : Colors.white,
-                size: 32,
+                _isRecording ? Icons.stop_rounded : Icons.mic_rounded,
+                color: Colors.white, size: 22,
               ),
             ),
           ),
         ),
-        const SizedBox(height: 10),
-        Text(
-          _isBusy
-              ? _statusLabel
-              : _status == _Status.micOpening
-              ? 'Opening mic…'
-              : _isRecording ? 'Release to send' : 'Hold to speak',
-          style: TextStyle(
-              color: cs.onSurface.withValues(alpha: 0.38), fontSize: 13),
-        ),
-      ],
-    ),
-  );
 
-  Widget _buildTextInput(ColorScheme cs) {
-    final canSend = !_isBusy && !_isRecording;
-    return Container(
-      padding: EdgeInsets.fromLTRB(
-        12, 10, 12,
-        MediaQuery.of(context).viewInsets.bottom +
-            MediaQuery.of(context).padding.bottom + 10,
-      ),
-      decoration: BoxDecoration(
-        color: const Color(0xFF111118),
-        border: Border(
-            top: BorderSide(color: cs.outlineVariant.withValues(alpha: 0.3))),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          Expanded(
+        const SizedBox(width: 10),
+
+        // Text field (3)
+        Expanded(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 120),
             child: TextField(
-              controller:      _textCtrl,
-              focusNode:       _textFocus,
-              minLines: 1,     maxLines: 5,
-              keyboardType:    TextInputType.multiline,
-              textInputAction: TextInputAction.newline,
-              style: const TextStyle(fontSize: 14.5, color: Colors.white),
+              controller: _textCtrl,
+              focusNode: _textFocus,
+              maxLines: null,
+              style: const TextStyle(color: _kText, fontSize: 15),
+              onSubmitted: (_) => _sendText(),
               decoration: InputDecoration(
-                hintText:  'Type a message…',
-                hintStyle: TextStyle(color: cs.onSurface.withValues(alpha: 0.35)),
-                filled:    true,
-                fillColor: const Color(0xFF16161F),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                hintText: 'Type a message…',
+                hintStyle: TextStyle(color: _kMuted.withOpacity(0.7), fontSize: 15),
+                filled: true,
+                fillColor: _kPanel,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(22),
-                  borderSide:   BorderSide.none,
+                  borderSide: const BorderSide(color: _kBorder),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(22),
+                  borderSide: const BorderSide(color: _kBorder),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(22),
+                  borderSide: const BorderSide(color: _kAccent, width: 1.5),
                 ),
               ),
-              onSubmitted: (_) { if (canSend) _sendText(); },
             ),
           ),
-          const SizedBox(width: 8),
-          AnimatedOpacity(
-            opacity:  canSend ? 1.0 : 0.35,
-            duration: const Duration(milliseconds: 200),
-            child: GestureDetector(
-              onTap: canSend ? _sendText : null,
-              child: Container(
-                width: 46, height: 46,
-                decoration: BoxDecoration(
-                  shape:     BoxShape.circle,
-                  color:     const Color(0xFF6C63FF),
-                  boxShadow: canSend ? [
-                    BoxShadow(
-                      color:        const Color(0xFF6C63FF).withValues(alpha: 0.42),
-                      blurRadius:   14, spreadRadius: 2,
-                    ),
-                  ] : [],
-                ),
-                child: const Icon(Icons.send_rounded, color: Colors.white, size: 20),
+        ),
+
+        const SizedBox(width: 10),
+
+        // Send button (1)
+        GestureDetector(
+          onTap: _sendText,
+          child: Container(
+            width: 46, height: 46,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _kAccent,
+              boxShadow: [BoxShadow(color: _kAccent.withOpacity(0.35), blurRadius: 12, spreadRadius: 1)],
+            ),
+            child: const Icon(Icons.send_rounded, color: Colors.white, size: 20),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// ── Status pill ────────────────────────────────────────────────────────────────
+
+class _StatusPill extends StatefulWidget {
+  final String label;
+  final Color  color;
+  const _StatusPill({required this.label, required this.color});
+  @override
+  State<_StatusPill> createState() => _StatusPillState();
+}
+
+class _StatusPillState extends State<_StatusPill> with SingleTickerProviderStateMixin {
+  late AnimationController _blink;
+  @override
+  void initState() {
+    super.initState();
+    _blink = AnimationController(vsync: this, duration: const Duration(milliseconds: 700))
+      ..repeat(reverse: true);
+  }
+  @override
+  void dispose() { _blink.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      FadeTransition(
+        opacity: _blink,
+        child: Container(
+          width: 6, height: 6,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: widget.color,
+            boxShadow: [BoxShadow(color: widget.color.withOpacity(0.6), blurRadius: 4)],
+          ),
+        ),
+      ),
+      const SizedBox(width: 5),
+      Text(widget.label,
+          style: TextStyle(color: widget.color, fontSize: 11, letterSpacing: 0.3)),
+    ]);
+  }
+}
+
+// ── Thinking bubble ────────────────────────────────────────────────────────────
+
+class _ThinkingBubble extends StatefulWidget {
+  const _ThinkingBubble();
+  @override
+  State<_ThinkingBubble> createState() => _ThinkingBubbleState();
+}
+
+class _ThinkingBubbleState extends State<_ThinkingBubble> with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))
+      ..repeat();
+  }
+  @override
+  void dispose() { _ctrl.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            decoration: BoxDecoration(
+              color: _kAiBg,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(14), topRight: Radius.circular(14),
+                bottomRight: Radius.circular(14), bottomLeft: Radius.circular(4),
               ),
+              border: Border.all(color: _kBorder),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: List.generate(3, (i) {
+                return AnimatedBuilder(
+                  animation: _ctrl,
+                  builder: (_, __) {
+                    final t = ((_ctrl.value * 3) - i).clamp(0.0, 1.0);
+                    final dy = -5.0 * (t < 0.5 ? t * 2 : (1 - t) * 2);
+                    return Transform.translate(
+                      offset: Offset(0, dy),
+                      child: Container(
+                        width: 7, height: 7,
+                        margin: const EdgeInsets.symmetric(horizontal: 3),
+                        decoration: const BoxDecoration(shape: BoxShape.circle, color: _kMuted),
+                      ),
+                    );
+                  },
+                );
+              }),
             ),
           ),
         ],
@@ -1154,491 +832,161 @@ class _ChatPageState extends State<ChatPage> with TickerProviderStateMixin {
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════════════
-// App bar
-// ════════════════════════════════════════════════════════════════════════════════
+// ── Message bubble ─────────────────────────────────────────────────────────────
 
-class _AppBar extends StatelessWidget implements PreferredSizeWidget {
-  final String             statusLabel;
-  final Color              statusColor;
-  final bool               isTextMode;
-  final ValueChanged<bool> onModeToggle;
-  const _AppBar({
-    required this.statusLabel, required this.statusColor,
-    required this.isTextMode,  required this.onModeToggle,
-  });
-  @override
-  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
+class _MessageBubble extends StatelessWidget {
+  final ChatMessage message;
+  const _MessageBubble({required this.message});
+
+  bool get _isUser => message.role == MessageRole.user;
 
   @override
-  Widget build(BuildContext context) => AppBar(
-    backgroundColor:  const Color(0xFF111118),
-    surfaceTintColor: Colors.transparent,
-    title: Row(
-      children: [
-        Container(
-          width: 36, height: 36,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(10),
-            gradient: const LinearGradient(
-              colors: [Color(0xFF6C63FF), Color(0xFFFF6B9D)],
-              begin: Alignment.topLeft, end: Alignment.bottomRight,
-            ),
-            boxShadow: const [BoxShadow(color: Color(0x666C63FF), blurRadius: 12)],
-          ),
-          child: const Center(child: Text('🚗', style: TextStyle(fontSize: 18))),
-        ),
-        const SizedBox(width: 10),
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('MyDrive',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white)),
-            Row(
-              children: [
-                Container(
-                  width: 6, height: 6,
-                  margin: const EdgeInsets.only(right: 5),
-                  decoration: BoxDecoration(shape: BoxShape.circle, color: statusColor),
-                ),
-                Text(statusLabel, style: TextStyle(fontSize: 11, color: statusColor)),
-              ],
-            ),
-          ],
-        ),
-      ],
-    ),
-    actions: [
-      Padding(
-        padding: const EdgeInsets.only(right: 12),
-        child: _ModeToggle(isTextMode: isTextMode, onToggle: onModeToggle),
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.0, end: 1.0),
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+      builder: (_, v, child) => Opacity(
+        opacity: v,
+        child: Transform.translate(offset: Offset(0, 8 * (1 - v)), child: child),
       ),
-    ],
-  );
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// Status dots
-// ════════════════════════════════════════════════════════════════════════════════
-
-class _StatusDots extends StatelessWidget {
-  final _Status             status;
-  final AnimationController controller;
-  const _StatusDots({required this.status, required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    final show = status == _Status.processing || status == _Status.speaking ||
-        status == _Status.micOpening;
-    return AnimatedSize(
-      duration: const Duration(milliseconds: 200),
-      child: show
-          ? Padding(
-        padding: const EdgeInsets.symmetric(vertical: 6),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Column(
+          crossAxisAlignment: _isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
-            _Dot(index: 0, controller: controller),
-            _Dot(index: 1, controller: controller),
-            _Dot(index: 2, controller: controller),
-            const SizedBox(width: 8),
-            Text(
-              status == _Status.processing
-                  ? 'MyDrive AI is thinking…'
-                  : status == _Status.micOpening
-                  ? 'Opening microphone…'
-                  : 'Speaking…',
-              style: const TextStyle(color: Color(0xFF5A5A72), fontSize: 12),
-            ),
+            if (message.kind == MessageKind.toolCall)
+              _ToolCallCard(data: message.toolData ?? {})
+            else
+              _buildBubble(context),
+            const SizedBox(height: 4),
+            if (_isUser) _buildMeta(),
           ],
-        ),
-      )
-          : const SizedBox.shrink(),
-    );
-  }
-}
-
-class _Dot extends StatelessWidget {
-  final int                index;
-  final AnimationController controller;
-  const _Dot({required this.index, required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    final begin = (index * 0.2).clamp(0.0, 1.0);
-    final end   = (begin + 0.4).clamp(0.0, 1.0);
-    final anim  = CurvedAnimation(
-      parent: controller,
-      curve:  Interval(begin, end, curve: Curves.easeInOut),
-    );
-    return AnimatedBuilder(
-      animation: anim,
-      builder: (_, __) => Opacity(
-        opacity: 0.3 + anim.value * 0.7,
-        child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 3),
-          width: 6, height: 6,
-          decoration: const BoxDecoration(
-            color: Color(0xFF6C63FF), shape: BoxShape.circle,
-          ),
         ),
       ),
     );
   }
-}
 
-// ════════════════════════════════════════════════════════════════════════════════
-// Chat bubble
-// ════════════════════════════════════════════════════════════════════════════════
+  Widget _buildBubble(BuildContext context) {
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 11),
+        decoration: BoxDecoration(
+          color: _isUser ? _kUserBg : _kAiBg,
+          borderRadius: BorderRadius.only(
+            topLeft:     const Radius.circular(14),
+            topRight:    const Radius.circular(14),
+            bottomLeft:  _isUser ? const Radius.circular(14) : const Radius.circular(4),
+            bottomRight: _isUser ? const Radius.circular(4)  : const Radius.circular(14),
+          ),
+          border: Border.all(color: _isUser ? _kAccent.withOpacity(0.25) : _kBorder),
+        ),
+        child: Text(message.text,
+            style: const TextStyle(color: _kText, fontSize: 15, height: 1.55)),
+      ),
+    );
+  }
 
-class _BubbleWidget extends StatelessWidget {
-  final BubbleItem bubble;
-  const _BubbleWidget({required this.bubble});
-
-  @override
-  Widget build(BuildContext context) {
-    final isUser = bubble.role == _Role.user;
+  Widget _buildMeta() {
+    final isVoice = message.kind == MessageKind.voice;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Align(
-        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.76),
-          child: Column(
-            crossAxisAlignment:
-            isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-            children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                decoration: BoxDecoration(
-                  color: isUser
-                      ? const Color(0xFF1E1B3A)
-                      : const Color(0xFF131320),
-                  border: Border.all(
-                    color: isUser
-                        ? const Color(0xFF6C63FF).withValues(alpha: 0.25)
-                        : const Color(0xFF22222E),
-                  ),
-                  borderRadius: BorderRadius.only(
-                    topLeft:     const Radius.circular(16),
-                    topRight:    const Radius.circular(16),
-                    bottomLeft:  Radius.circular(isUser ? 16 : 3),
-                    bottomRight: Radius.circular(isUser ? 3 : 16),
-                  ),
-                ),
-                child: Text(
-                  bubble.text,
-                  style: TextStyle(
-                    fontSize: 14.5, height: 1.5,
-                    color: isUser
-                        ? Colors.white
-                        : Colors.white.withValues(alpha: 0.85),
-                    fontStyle: isUser ? FontStyle.normal : FontStyle.italic,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 3),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(_metaIcon(isUser, bubble.input),
-                      size: 10, color: const Color(0xFF5A5A72)),
-                  const SizedBox(width: 3),
-                  Text(_metaLabel(isUser, bubble.input),
-                      style: const TextStyle(
-                          fontSize: 10, color: Color(0xFF5A5A72))),
-                  Text(_fmtTime(bubble.time),
-                      style: const TextStyle(
-                          fontSize: 10, color: Color(0xFF5A5A72))),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(isVoice ? Icons.mic_rounded : Icons.keyboard_rounded, size: 10, color: _kMuted),
+        const SizedBox(width: 4),
+        Text(isVoice ? 'Voice' : 'Text',
+            style: const TextStyle(color: _kMuted, fontSize: 10)),
+      ]),
     );
   }
-
-  IconData _metaIcon(bool isUser, _Input? input) {
-    if (!isUser) return Icons.mic_none_rounded;
-    return input == _Input.voice ? Icons.mic_rounded : Icons.keyboard_rounded;
-  }
-
-  String _metaLabel(bool isUser, _Input? input) {
-    if (!isUser) return 'MyDrive AI · ';
-    return input == _Input.voice ? 'Voice · ' : 'Text · ';
-  }
-
-  String _fmtTime(DateTime t) =>
-      '${t.hour.toString().padLeft(2, '0')}:'
-          '${t.minute.toString().padLeft(2, '0')}:'
-          '${t.second.toString().padLeft(2, '0')}';
 }
 
-// ════════════════════════════════════════════════════════════════════════════════
-// Tool card
-// ════════════════════════════════════════════════════════════════════════════════
+// ── Tool call card ─────────────────────────────────────────────────────────────
 
-class _ToolCardWidget extends StatelessWidget {
-  final ToolItem item;
-  const _ToolCardWidget({required this.item});
+class _ToolCallCard extends StatelessWidget {
+  final Map<String, dynamic> data;
+  const _ToolCallCard({required this.data});
 
-  static const _meta =
-  <String, ({String icon, String label, Color color})>{
-    'request_roadside_assistance': (
-    icon: '🔧', label: 'Roadside Assistance', color: Color(0xFFFFB830),
-    ),
-    'request_tow_truck': (
-    icon: '🚛', label: 'Tow Truck Dispatched', color: Color(0xFFFF4D6D),
-    ),
-    'search_spare_parts': (
-    icon: '🔩', label: 'Spare Parts Search', color: Color(0xFF6C63FF),
-    ),
-    'book_garage_service': (
-    icon: '🏪', label: 'Garage Booking', color: Color(0xFF00E5A0),
-    ),
+  static const _meta = {
+    'request_roadside_assistance': (label: '🔧 Roadside Assistance', color: _kAmber,  bg: Color(0x0FFFB830)),
+    'request_tow_truck':           (label: '🚛 Tow Truck',           color: _kRed,    bg: Color(0x0FFF4D6D)),
+    'search_spare_parts':          (label: '🔩 Spare Parts Search',  color: _kAccent, bg: Color(0x0F6C63FF)),
+    'book_garage_service':         (label: '🏪 Garage Service',      color: _kGreen,  bg: Color(0x0F00E5A0)),
   };
 
   @override
   Widget build(BuildContext context) {
-    final m     = _meta[item.tool];
-    final color = m?.color ?? const Color(0xFF5A5A72);
-    final icon  = m?.icon  ?? '⚙️';
-    final label = m?.label ?? item.tool;
+    final toolName = data['tool']   as String? ?? '';
+    final args     = data['args']   as Map<String, dynamic>? ?? {};
+    final result   = data['result'] as Map<String, dynamic>? ?? {};
+    final m        = _meta[toolName];
+    final color    = m?.color ?? _kMuted;
+    final bg       = m?.bg    ?? const Color(0x0F5A5A72);
+    final label    = m?.label ?? toolName;
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.92),
-          child: Container(
-            decoration: BoxDecoration(
-              color:  const Color(0xFF131320),
-              border: Border.all(color: color.withValues(alpha: 0.32)),
-              borderRadius: const BorderRadius.only(
-                topLeft:     Radius.circular(16),
-                topRight:    Radius.circular(16),
-                bottomRight: Radius.circular(16),
-                bottomLeft:  Radius.circular(3),
-              ),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _CardHeader(icon: icon, label: label, color: color),
-                Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      if (item.args.isNotEmpty) ...[
-                        const _SectionLabel('Parameters'),
-                        const SizedBox(height: 5),
-                        ...item.args.entries.map(
-                              (e) => _KVRow(k: e.key, v: e.value.toString()),
-                        ),
-                        const SizedBox(height: 10),
-                      ],
-                      if (item.result.isNotEmpty) ...[
-                        const _SectionLabel('Result'),
-                        const SizedBox(height: 5),
-                        Container(
-                          padding: const EdgeInsets.all(10),
-                          decoration: BoxDecoration(
-                            color:        const Color(0xFF16161F),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: const Color(0xFF22222E)),
-                          ),
-                          child: Column(
-                            children: item.result.entries
-                                .map((e) => _KVRow(
-                              k: e.key, v: e.value.toString(), mono: true,
-                            ))
-                                .toList(),
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ],
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 340),
+      decoration: BoxDecoration(
+        color: _kAiBg,
+        borderRadius: const BorderRadius.only(
+          topLeft: Radius.circular(14), topRight: Radius.circular(14),
+          bottomRight: Radius.circular(14), bottomLeft: Radius.circular(4),
+        ),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Header row
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(14), topRight: Radius.circular(14),
             ),
           ),
+          child: Row(children: [
+            Expanded(child: Text(label,
+                style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w700))),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: _kGreen.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: _kGreen.withOpacity(0.3)),
+              ),
+              child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.check_circle, size: 8, color: _kGreen),
+                SizedBox(width: 4),
+                Text('triggered', style: TextStyle(color: _kGreen, fontSize: 9)),
+              ]),
+            ),
+          ]),
         ),
-      ),
+        // Args + Result
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            if (args.isNotEmpty) ...[
+              _kv('args', _fmt(args), color),
+              const SizedBox(height: 6),
+            ],
+            if (result.isNotEmpty) _kv('result', _fmt(result), _kGreen),
+          ]),
+        ),
+      ]),
     );
   }
-}
 
-class _CardHeader extends StatelessWidget {
-  final String icon, label;
-  final Color  color;
-  const _CardHeader({required this.icon, required this.label, required this.color});
+  Widget _kv(String label, String value, Color labelColor) {
+    return RichText(text: TextSpan(children: [
+      TextSpan(text: '$label: ',
+          style: TextStyle(color: labelColor, fontSize: 12, fontWeight: FontWeight.w600)),
+      TextSpan(text: value,
+          style: const TextStyle(color: _kMuted, fontSize: 12)),
+    ]));
+  }
 
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-    decoration: BoxDecoration(
-      color: color.withValues(alpha: 0.07),
-      borderRadius: const BorderRadius.only(
-        topLeft: Radius.circular(15), topRight: Radius.circular(15),
-      ),
-      border: Border(bottom: BorderSide(color: color.withValues(alpha: 0.18))),
-    ),
-    child: Row(
-      children: [
-        Text(icon, style: const TextStyle(fontSize: 15)),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(label,
-              style: TextStyle(
-                  fontSize: 12, fontWeight: FontWeight.w700,
-                  color: color, letterSpacing: 0.3)),
-        ),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-          decoration: BoxDecoration(
-            color:        const Color(0xFF00E5A0).withValues(alpha: 0.10),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-                color: const Color(0xFF00E5A0).withValues(alpha: 0.28)),
-          ),
-          child: const Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _PulseDot(),
-              SizedBox(width: 5),
-              Text('Triggered',
-                  style: TextStyle(
-                      fontSize: 10, color: Color(0xFF00E5A0),
-                      fontWeight: FontWeight.w600)),
-            ],
-          ),
-        ),
-      ],
-    ),
-  );
-}
-
-class _PulseDot extends StatelessWidget {
-  const _PulseDot();
-  @override
-  Widget build(BuildContext context) => TweenAnimationBuilder<double>(
-    tween:    Tween(begin: 0.3, end: 1.0),
-    duration: const Duration(milliseconds: 700),
-    builder:  (_, v, child) => Opacity(opacity: v, child: child),
-    child: Container(
-      width: 5, height: 5,
-      decoration: const BoxDecoration(
-          shape: BoxShape.circle, color: Color(0xFF00E5A0)),
-    ),
-  );
-}
-
-class _SectionLabel extends StatelessWidget {
-  final String text;
-  const _SectionLabel(this.text);
-  @override
-  Widget build(BuildContext context) => Text(
-    text.toUpperCase(),
-    style: const TextStyle(
-      fontSize: 9.5, color: Color(0xFF5A5A72),
-      letterSpacing: 0.8, fontWeight: FontWeight.w600,
-    ),
-  );
-}
-
-class _KVRow extends StatelessWidget {
-  final String k, v;
-  final bool   mono;
-  const _KVRow({required this.k, required this.v, this.mono = false});
-
-  @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 2),
-    child: Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SizedBox(
-          width: 110,
-          child: Text(k, style: TextStyle(
-            fontSize: mono ? 11 : 13, color: const Color(0xFF5A5A72),
-            fontFamily: mono ? 'monospace' : null,
-          )),
-        ),
-        Expanded(
-          child: Text(v, style: TextStyle(
-            fontSize: mono ? 11 : 13, color: Colors.white,
-            fontFamily: mono ? 'monospace' : null,
-          )),
-        ),
-      ],
-    ),
-  );
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// Mode toggle
-// ════════════════════════════════════════════════════════════════════════════════
-
-class _ModeToggle extends StatelessWidget {
-  final bool               isTextMode;
-  final ValueChanged<bool> onToggle;
-  const _ModeToggle({required this.isTextMode, required this.onToggle});
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.all(3),
-    decoration: BoxDecoration(
-      color:        const Color(0xFF16161F),
-      borderRadius: BorderRadius.circular(20),
-      border:       Border.all(color: const Color(0xFF22222E)),
-    ),
-    child: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _Tab(label: 'Voice', icon: Icons.mic_rounded,
-            active: !isTextMode, onTap: () => onToggle(false)),
-        _Tab(label: 'Text',  icon: Icons.keyboard_rounded,
-            active:  isTextMode, onTap: () => onToggle(true)),
-      ],
-    ),
-  );
-}
-
-class _Tab extends StatelessWidget {
-  final String       label;
-  final IconData     icon;
-  final bool         active;
-  final VoidCallback onTap;
-  const _Tab({required this.label, required this.icon,
-    required this.active, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) => GestureDetector(
-    onTap: onTap,
-    child: AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      padding:  const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(
-        color:        active ? const Color(0xFF6C63FF) : Colors.transparent,
-        borderRadius: BorderRadius.circular(17),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 13,
-              color: active ? Colors.white : const Color(0xFF5A5A72)),
-          const SizedBox(width: 4),
-          Text(label, style: TextStyle(
-            fontSize: 11, fontWeight: FontWeight.w600,
-            color: active ? Colors.white : const Color(0xFF5A5A72),
-          )),
-        ],
-      ),
-    ),
-  );
+  String _fmt(Map<String, dynamic> m) =>
+      m.entries.map((e) => '${e.key}: ${e.value}').join(', ');
 }
