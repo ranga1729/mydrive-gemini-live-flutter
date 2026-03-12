@@ -594,7 +594,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
               end: Alignment.bottomRight,
             ),
             borderRadius: BorderRadius.circular(12),
-            boxShadow: [BoxShadow(color: _kAccent.withOpacity(0.35), blurRadius: 16)],
+            boxShadow: [BoxShadow(color: _kAccent.withValues(alpha: 0.35), blurRadius: 16)],
           ),
           child: const Center(child: Text('🚗', style: TextStyle(fontSize: 20))),
         ),
@@ -616,7 +616,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             decoration: BoxDecoration(
-              color: _speakerMode ? _kAccent.withOpacity(0.2) : _kPanel,
+              color: _speakerMode ? _kAccent.withValues(alpha: 0.2) : _kPanel,
               borderRadius: BorderRadius.circular(20),
               border: Border.all(color: _speakerMode ? _kAccent : _kBorder),
             ),
@@ -688,7 +688,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                 end: Alignment.bottomRight,
               ),
               borderRadius: BorderRadius.circular(20),
-              boxShadow: [BoxShadow(color: _kAccent.withOpacity(0.25), blurRadius: 24)],
+              boxShadow: [BoxShadow(color: _kAccent.withValues(alpha: 0.25), blurRadius: 24)],
             ),
             child: const Center(child: Text('🚗', style: TextStyle(fontSize: 32))),
           ),
@@ -738,7 +738,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                 shape: BoxShape.circle,
                 color: _isRecording ? _kRed : _kAccent,
                 boxShadow: [BoxShadow(
-                  color: (_isRecording ? _kRed : _kAccent).withOpacity(0.4),
+                  color: (_isRecording ? _kRed : _kAccent).withValues(alpha: 0.4),
                   blurRadius: _isRecording ? 20 : 10,
                   spreadRadius: 1,
                 )],
@@ -765,7 +765,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
               onSubmitted: (_) => _sendText(),
               decoration: InputDecoration(
                 hintText: 'Type a message…',
-                hintStyle: TextStyle(color: _kMuted.withOpacity(0.7), fontSize: 15),
+                hintStyle: TextStyle(color: _kMuted.withValues(alpha: 0.7), fontSize: 15),
                 filled: true,
                 fillColor: _kPanel,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -796,7 +796,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: _kAccent,
-              boxShadow: [BoxShadow(color: _kAccent.withOpacity(0.35), blurRadius: 12, spreadRadius: 1)],
+              boxShadow: [BoxShadow(color: _kAccent.withValues(alpha: 0.35), blurRadius: 12, spreadRadius: 1)],
             ),
             child: const Icon(Icons.send_rounded, color: Colors.white, size: 20),
           ),
@@ -835,7 +835,7 @@ class _StatusPillState extends State<_StatusPill> with SingleTickerProviderState
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             color: widget.color,
-            boxShadow: [BoxShadow(color: widget.color.withOpacity(0.6), blurRadius: 4)],
+            boxShadow: [BoxShadow(color: widget.color.withValues(alpha: 0.6), blurRadius: 4)],
           ),
         ),
       ),
@@ -955,7 +955,7 @@ class _MessageBubble extends StatelessWidget {
             bottomLeft:  _isUser ? const Radius.circular(14) : const Radius.circular(4),
             bottomRight: _isUser ? const Radius.circular(4)  : const Radius.circular(14),
           ),
-          border: Border.all(color: _isUser ? _kAccent.withOpacity(0.25) : _kBorder),
+          border: Border.all(color: _isUser ? _kAccent.withValues(alpha: 0.25) : _kBorder),
         ),
         child: Text(message.text,
             style: const TextStyle(color: _kText, fontSize: 15, height: 1.55)),
@@ -1007,7 +1007,7 @@ class _ToolCallCard extends StatelessWidget {
           topLeft: Radius.circular(14), topRight: Radius.circular(14),
           bottomRight: Radius.circular(14), bottomLeft: Radius.circular(4),
         ),
-        border: Border.all(color: color.withOpacity(0.3)),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         // Header row
@@ -1025,9 +1025,9 @@ class _ToolCallCard extends StatelessWidget {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
               decoration: BoxDecoration(
-                color: _kGreen.withOpacity(0.1),
+                color: _kGreen.withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: _kGreen.withOpacity(0.3)),
+                border: Border.all(color: _kGreen.withValues(alpha: 0.3)),
               ),
               child: const Row(mainAxisSize: MainAxisSize.min, children: [
                 Icon(Icons.check_circle, size: 8, color: _kGreen),
