@@ -1,37 +1,23 @@
 // lib/main.dart
-// MyDrive Assistant — Flutter Client
-// ====================================
-// Architecture
-// ─────────────
-// Two WebSocket connections are maintained simultaneously, sharing the same
-// session_id so the backend routes both to the identical Gemini session:
+// MyDrive Assistant — Flutter Client (Unified WebSocket API)
+// ============================================================
+// Architecture:
+//   Single WebSocket connection to /ws/chat?session_id=<id>
+//   - Outbound JSON: text_input, voice_start, voice_end, set_speaker, interrupt
+//   - Outbound binary: raw PCM 16kHz 16-bit (during voice)
+//   - Inbound JSON: session_ready, user_transcript, assistant_text, tool_call,
+//                   turn_complete, speaker_mode_updated, error, session_ended
+//   - Inbound binary: raw PCM 24kHz (when speaker mode is on)
 //
-//   /ws/chat?session_id=<id>  — voice channel
-//       Outbound : raw 16-bit PCM chunks (16 kHz mono) + "END_OF_SPEECH"
-//       Inbound  : binary PCM audio (24 kHz) + ALL JSON frames
-//
-//   /ws/text?session_id=<id>  — text channel
-//       Outbound : JSON {"type":"message","text":"..."}
-//       Inbound  : JSON frames ONLY (no binary audio)
-//
-// Because the backend now sends audio ONLY to voice subscribers, there is
-// NO frame duplication — each JSON frame is processed exactly once (via the
-// text channel listener), and audio is played from the voice channel.
-//
-// pubspec.yaml dependencies:
+// Dependencies (pubspec.yaml):
 //   record: ^6.2.0
 //   web_socket_channel: ^3.0.1
 //   permission_handler: ^12.0.1
 //   flutter_pcm_sound: ^3.3.3
 //   uuid: ^4.0.0
 //
-// Android AndroidManifest.xml:
-//   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
-//   <uses-permission android:name="android.permission.INTERNET"/>
-//   <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
-//
-// iOS Info.plist:
-//   NSMicrophoneUsageDescription → "MyDrive needs your microphone for voice commands."
+// Android permissions: RECORD_AUDIO, INTERNET, MODIFY_AUDIO_SETTINGS
+// iOS: NSMicrophoneUsageDescription
 
 import 'dart:async';
 import 'dart:convert';
@@ -50,7 +36,7 @@ const int    _kOutSampleRate  = 24000; // Gemini output: 24 kHz PCM
 const int    _kInSampleRate   = 16000; // Gemini input:  16 kHz PCM
 const int    _kFeedThreshold  = 4800;  // ~200 ms worth of frames at 24 kHz
 
-// ── Palette ────────────────────────────────────────────────────────────────────
+// ── Palette (unchanged) ────────────────────────────────────────────────────────
 const _kBg      = Color(0xFF0A0A0F);
 const _kSurface = Color(0xFF111118);
 const _kPanel   = Color(0xFF16161F);
@@ -127,24 +113,22 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
-
   // ── Session & messages ───────────────────────────────────────────────────────
   String _sessionId = const Uuid().v4();
   final List<ChatMessage> _messages = [];
   AppStatus _status = AppStatus.disconnected;
   bool _isRecording  = false;
   bool _showThinking = false;
+  bool _speakerMode = false; // current speaker mode (from server)
 
   // ── Controllers ──────────────────────────────────────────────────────────────
   final ScrollController      _scrollCtrl = ScrollController();
   final TextEditingController _textCtrl   = TextEditingController();
   final FocusNode             _textFocus  = FocusNode();
 
-  // ── WebSockets ───────────────────────────────────────────────────────────────
-  WebSocketChannel?   _voiceWs;
-  WebSocketChannel?   _textWs;
-  StreamSubscription? _voiceSub;
-  StreamSubscription? _textSub;
+  // ── WebSocket (single connection) ────────────────────────────────────────────
+  WebSocketChannel?   _ws;
+  StreamSubscription? _wsSub;
 
   // ── Audio recording ──────────────────────────────────────────────────────────
   final AudioRecorder _recorder = AudioRecorder();
@@ -154,11 +138,11 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   final List<Uint8List> _audioQueue = [];
   bool _isPlaying = false;
 
-  // ── Transcript state ─────────────────────────────────────────────────────────
-  // IDs of the bubbles currently being built by streaming transcript chunks.
-  // Cleared on 'done' and on new chat so each turn starts fresh.
-  String? _pendingUserBubbleId;
-  String? _pendingAiBubbleId;
+  // ── Turn tracking (for streaming assistant text) ─────────────────────────────
+  // During a turn, we update the last AI message with new full text.
+  // The turn ends on 'turn_complete'.
+  bool _inTurn = false;
+  String? _currentAiMessageId; // ID of the AI message being updated
 
   // ── Mic animation ─────────────────────────────────────────────────────────────
   late AnimationController _pulseCtrl;
@@ -174,7 +158,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _pulseCtrl.stop();
 
     FlutterPcmSound.setFeedCallback(_onPcmFeedRequest);
-    _connectAll();
+    _connect();
   }
 
   @override
@@ -183,81 +167,43 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _scrollCtrl.dispose();
     _textCtrl.dispose();
     _textFocus.dispose();
-    _disconnectAll();
+    _disconnect();
     _recorder.dispose();
     FlutterPcmSound.release();
     super.dispose();
   }
 
   // ── Connection ────────────────────────────────────────────────────────────────
-
-  void _connectAll() {
+  void _connect() {
     _setStatus(AppStatus.connecting);
-    _connectVoice();
-    _connectText();
-  }
-
-  void _connectVoice() {
-    _voiceSub?.cancel();
-    _voiceWs?.sink.close();
     final uri = Uri.parse('wss://$_kHost/ws/chat?session_id=$_sessionId');
-    _voiceWs = WebSocketChannel.connect(uri);
-    _voiceSub = _voiceWs!.stream.listen(
-      _onVoiceFrame,
-      onDone:  () { if (mounted) _setStatus(AppStatus.disconnected); },
-      onError: (_) { if (mounted) _setStatus(AppStatus.error); },
+    _ws = WebSocketChannel.connect(uri);
+    _wsSub = _ws!.stream.listen(
+      _onMessage,
+      onDone:  () => _setStatus(AppStatus.disconnected),
+      onError: (_) => _setStatus(AppStatus.error),
     );
   }
 
-  void _connectText() {
-    _textSub?.cancel();
-    _textWs?.sink.close();
-    final uri = Uri.parse('wss://$_kHost/ws/text?session_id=$_sessionId');
-    _textWs = WebSocketChannel.connect(uri);
-    _textSub = _textWs!.stream.listen(
-      _onTextFrame,
-      onDone:  () {},
-      onError: (_) { if (mounted) _setStatus(AppStatus.error); },
-    );
+  void _disconnect() {
+    _wsSub?.cancel();
+    _ws?.sink.close();
+    _ws = null;
   }
 
-  void _disconnectAll() {
-    _voiceSub?.cancel();
-    _textSub?.cancel();
-    _voiceWs?.sink.close();
-    _textWs?.sink.close();
-    _voiceWs = null;
-    _textWs  = null;
-  }
-
-  // ── Incoming frame routing ────────────────────────────────────────────────────
-  //
-  // Voice channel → binary only (PCM audio to play)
-  // Text channel  → JSON only   (status, transcripts, tool calls)
-  //
-  // This is enforced by the backend (broadcast_audio vs broadcast_json).
-  // The client respects the same split: no JSON from voice, no audio from text.
-
-  void _onVoiceFrame(dynamic raw) {
-    // The backend only sends binary PCM to voice subscribers.
-    // Any stray JSON (e.g. session_info on connect) is ignored intentionally.
+  // ── Incoming message handler (both JSON and binary) ──────────────────────────
+  void _onMessage(dynamic raw) {
     if (raw is Uint8List) {
+      // Binary PCM audio (24 kHz) – only sent when speaker mode is on
       _enqueueAudio(raw);
     } else if (raw is List<int>) {
       _enqueueAudio(Uint8List.fromList(raw));
+    } else if (raw is String) {
+      _handleJson(raw);
     }
-    // String/JSON frames on the voice channel are intentionally ignored —
-    // the text channel listener handles all JSON.
   }
 
-  void _onTextFrame(dynamic raw) {
-    // The backend sends NO binary audio to text subscribers.
-    // Everything here is JSON.
-    if (raw is String) _handleJson(raw);
-  }
-
-  // ── JSON frame handler (called only from text channel) ────────────────────────
-
+  // ── JSON frame handler ───────────────────────────────────────────────────────
   void _handleJson(String raw) {
     Map<String, dynamic> data;
     try {
@@ -266,76 +212,92 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       return;
     }
 
-    final status = data['status'] as String?;
-    final type   = data['type']   as String?;
+    final type = data['type'] as String?;
 
-    // ── Status frames ──────────────────────────────────────────────────────────
-    if (status != null) {
-      switch (status) {
-        case 'ready':
-          _setStatus(AppStatus.ready);
-
-        case 'processing':
-          _setStatus(AppStatus.processing);
-          if (!_showThinking) setState(() => _showThinking = true);
-
-        case 'done':
-        // Audio may still be playing; status becomes 'ready' once it drains
-          if (!_isPlaying) _setStatus(AppStatus.ready);
-          setState(() => _showThinking = false);
-          // Reset per-turn tracking so next turn creates fresh bubbles
-          _pendingUserBubbleId = null;
-          _pendingAiBubbleId   = null;
-
-        case 'error':
-          _setStatus(AppStatus.error);
-          _addMessage(ChatMessage(
-            id: _uuid(), role: MessageRole.ai, kind: MessageKind.text,
-            text: '⚠️ ${data['message'] ?? 'Unknown error'}',
-          ));
-
-        case 'session_ended':
-          _setStatus(AppStatus.disconnected);
-      }
-      return;
-    }
-
-    // ── Typed frames ───────────────────────────────────────────────────────────
     switch (type) {
+      case 'session_ready':
+        _setStatus(AppStatus.ready);
+        _speakerMode = data['speaker_mode'] as bool? ?? false;
+        break;
 
-    // User voice transcript — arrives in chunks, append to same bubble
       case 'user_transcript':
-        final chunk = (data['text'] as String? ?? '').trim();
-        if (chunk.isEmpty) return;
-        if (_pendingUserBubbleId != null) {
-          _appendToMessage(_pendingUserBubbleId!, ' $chunk');
-        } else {
-          final id = _uuid();
-          _pendingUserBubbleId = id;
-          _addMessage(ChatMessage(
-            id: id, role: MessageRole.user, kind: MessageKind.voice, text: chunk,
-          ));
-        }
+      // Full user voice transcript – update or create user bubble
+        final text = (data['text'] as String? ?? '').trim();
+        if (text.isEmpty) return;
+        // Find last user voice message from this turn and update, or create new
+        // For simplicity, we always create a new user bubble for each transcript.
+        // But since Gemini may send multiple transcripts for the same utterance,
+        // we might want to update the last user voice message if it's recent.
+        // We'll update the last user voice message if it exists and is within the same turn.
+        // A simpler approach: always create a new bubble; but that would flood.
+        // Better: look for the most recent user message of kind voice and update its text.
+        setState(() {
+          final lastUserVoice = _messages.lastWhere(
+                (m) => m.role == MessageRole.user && m.kind == MessageKind.voice,
+            orElse: () => ChatMessage(id: '', role: MessageRole.user, kind: MessageKind.voice, text: ''),
+          );
+          if (lastUserVoice.id.isNotEmpty) {
+            lastUserVoice.text = text;
+          } else {
+            _messages.add(ChatMessage(
+              id: _uuid(),
+              role: MessageRole.user,
+              kind: MessageKind.voice,
+              text: text,
+            ));
+          }
+        });
+        _scrollToBottom();
+        break;
 
-    // Gemini voice transcript — arrives in chunks, append to same bubble
-      case 'gemini_transcript':
-        final chunk = (data['text'] as String? ?? '').trim();
-        if (chunk.isEmpty) return;
-        setState(() => _showThinking = false);
-        if (_pendingAiBubbleId != null) {
-          _appendToMessage(_pendingAiBubbleId!, ' $chunk');
-        } else {
-          final id = _uuid();
-          _pendingAiBubbleId = id;
-          _addMessage(ChatMessage(
-            id: id, role: MessageRole.ai, kind: MessageKind.text, text: chunk,
-          ));
-        }
+      case 'assistant_text':
+      // Gemini sends output_audio_transcription as multiple partial fragments
+      // per turn (e.g. "Hi!", then " How can", then " I help you today?").
+      // We APPEND each fragment to the same bubble until turn_complete resets
+      // the turn. Never replace — that's what caused the single-word flicker.
+        final fragment = data['text'] as String? ?? '';
+        if (fragment.isEmpty) return;
+        setState(() {
+          _showThinking = false;
+          if (_inTurn && _currentAiMessageId != null) {
+            // Append fragment to the existing bubble
+            final index = _messages.indexWhere((m) => m.id == _currentAiMessageId);
+            if (index != -1) {
+              final current = _messages[index].text;
+              // Add a space between fragments only when needed
+              final needsSpace = current.isNotEmpty &&
+                  !current.endsWith(' ') &&
+                  !fragment.startsWith(' ');
+              _messages[index].text = needsSpace
+                  ? '$current $fragment'
+                  : '$current$fragment';
+            } else {
+              // Message was removed unexpectedly — start fresh
+              _currentAiMessageId = _uuid();
+              _messages.add(ChatMessage(
+                id: _currentAiMessageId!,
+                role: MessageRole.ai,
+                kind: MessageKind.text,
+                text: fragment,
+              ));
+            }
+          } else {
+            // First fragment of a new turn — create the bubble
+            _inTurn = true;
+            _currentAiMessageId = _uuid();
+            _messages.add(ChatMessage(
+              id: _currentAiMessageId!,
+              role: MessageRole.ai,
+              kind: MessageKind.text,
+              text: fragment,
+            ));
+          }
+        });
+        _scrollToBottom();
+        break;
 
-    // Tool call card — one per tool invocation, no deduplication needed
-    // because the backend broadcasts each tool_call exactly once (broadcast_json)
-    // and only the text channel processes JSON.
       case 'tool_call':
+      // Tool call card
         _addMessage(ChatMessage(
           id: _uuid(),
           role: MessageRole.ai,
@@ -343,15 +305,43 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           text: data['tool'] as String? ?? 'tool',
           toolData: Map<String, dynamic>.from(data),
         ));
+        break;
 
-    // session_info — we own the session_id, nothing to do
-      case 'session_info':
+      case 'turn_complete':
+      // End of turn – reset streaming state
+        setState(() {
+          _inTurn = false;
+          _currentAiMessageId = null;
+        });
+        break;
+
+      case 'speaker_mode_updated':
+        setState(() {
+          _speakerMode = data['enabled'] as bool? ?? false;
+        });
+        break;
+
+      case 'error':
+        _setStatus(AppStatus.error);
+        _addMessage(ChatMessage(
+          id: _uuid(),
+          role: MessageRole.ai,
+          kind: MessageKind.text,
+          text: '⚠️ ${data['message'] ?? 'Unknown error'}',
+        ));
+        break;
+
+      case 'session_ended':
+        _setStatus(AppStatus.disconnected);
+        break;
+
+      default:
+      // Ignore unknown types
         break;
     }
   }
 
   // ── PCM playback ──────────────────────────────────────────────────────────────
-
   void _enqueueAudio(Uint8List pcm) {
     _audioQueue.add(pcm);
     if (!_isPlaying) _startPlayback();
@@ -375,7 +365,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     FlutterPcmSound.feed(PcmArrayInt16.fromList(samples));
   }
 
-  // Called by flutter_pcm_sound when its internal buffer needs more data
   void _onPcmFeedRequest(int remainingFrames) {
     if (remainingFrames == 0) _feedNext();
   }
@@ -390,7 +379,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   // ── Voice recording ───────────────────────────────────────────────────────────
-
   Future<void> _startRecording() async {
     if (_isRecording) return;
 
@@ -403,7 +391,10 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       return;
     }
 
-    if (_voiceWs == null) _connectVoice();
+    if (_ws == null) _connect();
+
+    // Send voice_start
+    _sendJson({'type': 'voice_start'});
 
     final stream = await _recorder.startStream(const RecordConfig(
       encoder:     AudioEncoder.pcm16bits,
@@ -414,7 +405,10 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       autoGain:    true,
     ));
 
-    _recordSub = stream.listen((chunk) => _voiceWs?.sink.add(chunk));
+    _recordSub = stream.listen((chunk) {
+      // Send raw PCM chunks while recording
+      _ws?.sink.add(chunk);
+    });
 
     setState(() {
       _isRecording  = true;
@@ -431,7 +425,8 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _recordSub = null;
     await _recorder.stop();
 
-    _voiceWs?.sink.add('END_OF_SPEECH');
+    // Send voice_end
+    _sendJson({'type': 'voice_end'});
 
     setState(() {
       _isRecording  = false;
@@ -444,13 +439,12 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   // ── Text sending ──────────────────────────────────────────────────────────────
-
   void _sendText() {
     final text = _textCtrl.text.trim();
     if (text.isEmpty) return;
-    if (_textWs == null) _connectText();
+    if (_ws == null) _connect();
 
-    // Show user bubble immediately — no transcript will arrive for text turns
+    // Show user bubble immediately
     _addMessage(ChatMessage(
       id: _uuid(), role: MessageRole.user, kind: MessageKind.text, text: text,
     ));
@@ -458,17 +452,38 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _textCtrl.clear();
     setState(() {
       _showThinking    = true;
-      _pendingAiBubbleId = null; // next gemini_transcript chunk starts a new bubble
+      _inTurn = false; // new turn starts
+      _currentAiMessageId = null;
     });
 
-    _textWs?.sink.add(jsonEncode({'type': 'message', 'text': text}));
+    _sendJson({'type': 'text_input', 'text': text});
     _setStatus(AppStatus.processing);
   }
 
-  // ── New chat ──────────────────────────────────────────────────────────────────
+  // ── Speaker toggle ────────────────────────────────────────────────────────────
+  void _toggleSpeaker() {
+    _sendJson({'type': 'set_speaker', 'enabled': !_speakerMode});
+    // Optimistic update; server will confirm with speaker_mode_updated
+    setState(() {
+      _speakerMode = !_speakerMode;
+    });
+  }
 
+  // ── Interrupt ─────────────────────────────────────────────────────────────────
+  void _sendInterrupt() {
+    _sendJson({'type': 'interrupt'});
+    // Clear audio queue immediately
+    _audioQueue.clear();
+    setState(() {
+      _showThinking = false;
+      _inTurn = false;
+      _currentAiMessageId = null;
+    });
+  }
+
+  // ── New chat ──────────────────────────────────────────────────────────────────
   void _newChat() {
-    _disconnectAll();
+    _disconnect();
     _audioQueue.clear();
     _isPlaying = false;
 
@@ -477,28 +492,20 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       _messages.clear();
       _showThinking        = false;
       _isRecording         = false;
-      _pendingUserBubbleId = null;
-      _pendingAiBubbleId   = null;
+      _inTurn              = false;
+      _currentAiMessageId  = null;
+      _speakerMode         = false;
     });
 
-    _connectAll();
+    _connect();
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────────
-
   void _setStatus(AppStatus s) { if (mounted) setState(() => _status = s); }
 
   void _addMessage(ChatMessage msg) {
     setState(() => _messages.add(msg));
     _scrollToBottom();
-  }
-
-  /// Append a chunk of text to an existing bubble (streaming transcript).
-  void _appendToMessage(String id, String chunk) {
-    setState(() {
-      final idx = _messages.indexWhere((m) => m.id == id);
-      if (idx != -1) _messages[idx].text += chunk;
-    });
   }
 
   void _scrollToBottom() {
@@ -511,6 +518,12 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         );
       }
     });
+  }
+
+  void _sendJson(Map<String, dynamic> json) {
+    if (_ws != null) {
+      _ws!.sink.add(jsonEncode(json));
+    }
   }
 
   String _uuid() => const Uuid().v4();
@@ -526,7 +539,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   };
 
   // ── Build ──────────────────────────────────────────────────────────────────────
-
   @override
   Widget build(BuildContext context) {
     final (statusLabel, statusColor) = _statusInfo;
@@ -544,8 +556,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
   }
 
-  // ── Header ─────────────────────────────────────────────────────────────────────
-
+  // ── Header with speaker toggle ────────────────────────────────────────────────
   Widget _buildHeader(String statusLabel, Color statusColor) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -576,6 +587,52 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             _StatusPill(label: statusLabel, color: statusColor),
           ]),
         ),
+        // Speaker toggle
+        GestureDetector(
+          onTap: _toggleSpeaker,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: _speakerMode ? _kAccent.withOpacity(0.2) : _kPanel,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: _speakerMode ? _kAccent : _kBorder),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  _speakerMode ? Icons.volume_up : Icons.volume_off,
+                  color: _speakerMode ? _kAccent : _kMuted,
+                  size: 16,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  _speakerMode ? 'ON' : 'OFF',
+                  style: TextStyle(
+                    color: _speakerMode ? _kAccent : _kMuted,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        // Interrupt button
+        GestureDetector(
+          onTap: _sendInterrupt,
+          child: Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: _kPanel,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: _kBorder),
+            ),
+            child: const Icon(Icons.stop_rounded, color: _kRed, size: 18),
+          ),
+        ),
+        const SizedBox(width: 8),
         // New chat
         TextButton(
           onPressed: _newChat,
@@ -585,15 +642,14 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             side: const BorderSide(color: _kBorder),
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
           ),
-          child: const Text('New Chat',
+          child: const Text('New',
               style: TextStyle(color: _kMuted, fontSize: 12, fontWeight: FontWeight.w600)),
         ),
       ]),
     );
   }
 
-  // ── Message list ───────────────────────────────────────────────────────────────
-
+  // ── Message list (unchanged from previous) ────────────────────────────────────
   Widget _buildMessageList() {
     final count = _messages.length + (_showThinking ? 1 : 0);
 
@@ -634,15 +690,14 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
   }
 
-  // ── Input bar ──────────────────────────────────────────────────────────────────
-
+  // ── Input bar (unchanged) ─────────────────────────────────────────────────────
   Widget _buildInputBar() {
     return Container(
       color: _kSurface,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
 
-        // Mic button (2)
+        // Mic button (hold to record)
         GestureDetector(
           onLongPressStart: (_) => _startRecording(),
           onLongPressEnd:   (_) => _stopRecording(),
@@ -675,7 +730,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
         const SizedBox(width: 10),
 
-        // Text field (3)
+        // Text field
         Expanded(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 120),
@@ -710,7 +765,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
         const SizedBox(width: 10),
 
-        // Send button (1)
+        // Send button
         GestureDetector(
           onTap: _sendText,
           child: Container(
@@ -728,8 +783,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 }
 
-// ── Status pill ────────────────────────────────────────────────────────────────
-
+// ── Status pill (unchanged) ────────────────────────────────────────────────────
 class _StatusPill extends StatefulWidget {
   final String label;
   final Color  color;
@@ -769,8 +823,7 @@ class _StatusPillState extends State<_StatusPill> with SingleTickerProviderState
   }
 }
 
-// ── Thinking bubble ────────────────────────────────────────────────────────────
-
+// ── Thinking bubble (unchanged) ────────────────────────────────────────────────
 class _ThinkingBubble extends StatefulWidget {
   const _ThinkingBubble();
   @override
@@ -832,8 +885,7 @@ class _ThinkingBubbleState extends State<_ThinkingBubble> with SingleTickerProvi
   }
 }
 
-// ── Message bubble ─────────────────────────────────────────────────────────────
-
+// ── Message bubble (unchanged) ─────────────────────────────────────────────────
 class _MessageBubble extends StatelessWidget {
   final ChatMessage message;
   const _MessageBubble({required this.message});
@@ -902,8 +954,7 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
-// ── Tool call card ─────────────────────────────────────────────────────────────
-
+// ── Tool call card (unchanged) ─────────────────────────────────────────────────
 class _ToolCallCard extends StatelessWidget {
   final Map<String, dynamic> data;
   const _ToolCallCard({required this.data});
