@@ -138,11 +138,14 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   final List<Uint8List> _audioQueue = [];
   bool _isPlaying = false;
 
-  // ── Turn tracking (for streaming assistant text) ─────────────────────────────
-  // During a turn, we update the last AI message with new full text.
-  // The turn ends on 'turn_complete'.
+  // ── Turn tracking ────────────────────────────────────────────────────────────
+  // Both the user voice bubble and the AI reply bubble stream in as fragments.
+  // We track the in-progress bubble ID for each role so we can append fragments
+  // to the right bubble and create a fresh one on every new turn.
+  // Both IDs are cleared on turn_complete and on every new input action.
   bool _inTurn = false;
-  String? _currentAiMessageId; // ID of the AI message being updated
+  String? _currentAiMessageId;        // AI bubble being built this turn
+  String? _currentUserVoiceMessageId; // User voice bubble being built this turn
 
   // ── Mic animation ─────────────────────────────────────────────────────────────
   late AnimationController _pulseCtrl;
@@ -221,50 +224,19 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         break;
 
       case 'user_transcript':
-      // Full user voice transcript – update or create user bubble
-        final text = (data['text'] as String? ?? '').trim();
-        if (text.isEmpty) return;
-        // Find last user voice message from this turn and update, or create new
-        // For simplicity, we always create a new user bubble for each transcript.
-        // But since Gemini may send multiple transcripts for the same utterance,
-        // we might want to update the last user voice message if it's recent.
-        // We'll update the last user voice message if it exists and is within the same turn.
-        // A simpler approach: always create a new bubble; but that would flood.
-        // Better: look for the most recent user message of kind voice and update its text.
-        setState(() {
-          final lastUserVoice = _messages.lastWhere(
-                (m) => m.role == MessageRole.user && m.kind == MessageKind.voice,
-            orElse: () => ChatMessage(id: '', role: MessageRole.user, kind: MessageKind.voice, text: ''),
-          );
-          if (lastUserVoice.id.isNotEmpty) {
-            lastUserVoice.text = text;
-          } else {
-            _messages.add(ChatMessage(
-              id: _uuid(),
-              role: MessageRole.user,
-              kind: MessageKind.voice,
-              text: text,
-            ));
-          }
-        });
-        _scrollToBottom();
-        break;
-
-      case 'assistant_text':
-      // Gemini sends output_audio_transcription as multiple partial fragments
-      // per turn (e.g. "Hi!", then " How can", then " I help you today?").
-      // We APPEND each fragment to the same bubble until turn_complete resets
-      // the turn. Never replace — that's what caused the single-word flicker.
+      // input_audio_transcription arrives as multiple partial fragments per turn
+      // (same behaviour as output_audio_transcription for the AI side).
+      // We append each fragment to the same bubble, identified by
+      // _currentUserVoiceMessageId, which is reset on every new voice turn
+      // so the next turn always gets a brand-new bubble.
         final fragment = data['text'] as String? ?? '';
         if (fragment.isEmpty) return;
         setState(() {
-          _showThinking = false;
-          if (_inTurn && _currentAiMessageId != null) {
-            // Append fragment to the existing bubble
-            final index = _messages.indexWhere((m) => m.id == _currentAiMessageId);
+          if (_currentUserVoiceMessageId != null) {
+            // Append fragment to the in-progress user bubble
+            final index = _messages.indexWhere((m) => m.id == _currentUserVoiceMessageId);
             if (index != -1) {
               final current = _messages[index].text;
-              // Add a space between fragments only when needed
               final needsSpace = current.isNotEmpty &&
                   !current.endsWith(' ') &&
                   !fragment.startsWith(' ');
@@ -272,7 +244,51 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                   ? '$current $fragment'
                   : '$current$fragment';
             } else {
-              // Message was removed unexpectedly — start fresh
+              // Bubble was removed unexpectedly — start a new one
+              _currentUserVoiceMessageId = _uuid();
+              _messages.add(ChatMessage(
+                id: _currentUserVoiceMessageId!,
+                role: MessageRole.user,
+                kind: MessageKind.voice,
+                text: fragment,
+              ));
+            }
+          } else {
+            // First fragment of a new voice turn — create the bubble
+            _currentUserVoiceMessageId = _uuid();
+            _messages.add(ChatMessage(
+              id: _currentUserVoiceMessageId!,
+              role: MessageRole.user,
+              kind: MessageKind.voice,
+              text: fragment,
+            ));
+          }
+        });
+        _scrollToBottom();
+        break;
+
+      case 'assistant_text':
+      // output_audio_transcription arrives as multiple partial fragments per turn.
+      // Do NOT trim — Gemini uses leading spaces as natural word separators.
+      // Append every fragment to the same bubble until turn_complete resets the turn.
+        final fragment = data['text'] as String? ?? '';
+        if (fragment.isEmpty) return;
+        setState(() {
+          _showThinking = false;
+          if (_inTurn && _currentAiMessageId != null) {
+            // Append fragment to the in-progress AI bubble
+            final index = _messages.indexWhere((m) => m.id == _currentAiMessageId);
+            if (index != -1) {
+              final current = _messages[index].text;
+              // Insert a space only when neither side already has one
+              final needsSpace = current.isNotEmpty &&
+                  !current.endsWith(' ') &&
+                  !fragment.startsWith(' ');
+              _messages[index].text = needsSpace
+                  ? '$current $fragment'
+                  : '$current$fragment';
+            } else {
+              // Bubble removed unexpectedly — start a fresh one
               _currentAiMessageId = _uuid();
               _messages.add(ChatMessage(
                 id: _currentAiMessageId!,
@@ -308,10 +324,11 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         break;
 
       case 'turn_complete':
-      // End of turn – reset streaming state
+      // End of turn — reset both streaming IDs so the next turn gets fresh bubbles
         setState(() {
           _inTurn = false;
           _currentAiMessageId = null;
+          _currentUserVoiceMessageId = null;
         });
         break;
 
@@ -431,6 +448,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     setState(() {
       _isRecording  = false;
       _showThinking = true;
+      _inTurn = false;               // new turn about to start
+      _currentAiMessageId = null;
+      _currentUserVoiceMessageId = null; // fresh bubble for this utterance
     });
     _pulseCtrl
       ..stop()
@@ -451,9 +471,10 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
     _textCtrl.clear();
     setState(() {
-      _showThinking    = true;
-      _inTurn = false; // new turn starts
-      _currentAiMessageId = null;
+      _showThinking              = true;
+      _inTurn                    = false;
+      _currentAiMessageId        = null;
+      _currentUserVoiceMessageId = null;
     });
 
     _sendJson({'type': 'text_input', 'text': text});
@@ -478,6 +499,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       _showThinking = false;
       _inTurn = false;
       _currentAiMessageId = null;
+      _currentUserVoiceMessageId = null;
     });
   }
 
@@ -488,13 +510,14 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _isPlaying = false;
 
     setState(() {
-      _sessionId           = const Uuid().v4();
+      _sessionId                 = const Uuid().v4();
       _messages.clear();
-      _showThinking        = false;
-      _isRecording         = false;
-      _inTurn              = false;
-      _currentAiMessageId  = null;
-      _speakerMode         = false;
+      _showThinking              = false;
+      _isRecording               = false;
+      _inTurn                    = false;
+      _currentAiMessageId        = null;
+      _currentUserVoiceMessageId = null;
+      _speakerMode               = false;
     });
 
     _connect();
