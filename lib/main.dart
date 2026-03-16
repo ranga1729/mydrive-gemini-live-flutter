@@ -4,10 +4,28 @@
 // Architecture:
 //   Single WebSocket connection to /ws/chat?session_id=<id>
 //   - Outbound JSON: text_input, voice_start, voice_end, set_speaker, interrupt
-//   - Outbound binary: raw PCM 16kHz 16-bit (during voice)
+//   - Outbound binary: raw PCM 16kHz 16-bit (streamed in real-time, no buffering)
 //   - Inbound JSON: session_ready, user_transcript, assistant_text, tool_call,
 //                   turn_complete, speaker_mode_updated, error, session_ended
 //   - Inbound binary: raw PCM 24kHz (when speaker mode is on)
+//
+// Streaming audio design (v2)
+// ───────────────────────────
+// Each PCM chunk from the microphone is sent to the server as a binary
+// WebSocket frame immediately — there is NO local accumulation.
+//
+// Signal sequence:
+//   1. User taps mic  → send JSON {"type":"voice_start"}
+//                       server sends activity_start to Gemini,
+//                       spawns a background receive task
+//   2. Mic is open    → each PCM chunk sent as raw binary immediately
+//                       server forwards each to Gemini via send_realtime_input
+//   3. User taps again→ send JSON {"type":"voice_end"}
+//                       server sends activity_end to Gemini,
+//                       awaits the full response
+//
+// This means Gemini starts processing the user's first words while they are
+// still speaking — the utterance duration is no longer on the critical path.
 //
 // Dependencies (pubspec.yaml):
 //   record: ^6.2.0
@@ -31,12 +49,12 @@ import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:uuid/uuid.dart';
 
 // ── Backend ────────────────────────────────────────────────────────────────────
-const String _kHost           = 'mydrive-gemini-live-cueufbg0avdtg3de.canadacentral-01.azurewebsites.net';
-const int    _kOutSampleRate  = 24000; // Gemini output: 24 kHz PCM
-const int    _kInSampleRate   = 16000; // Gemini input:  16 kHz PCM
-const int    _kFeedThreshold  = 4800;  // ~200 ms worth of frames at 24 kHz
+const String _kHost          = 'mydrive-gemini-live-cueufbg0avdtg3de.canadacentral-01.azurewebsites.net';
+const int    _kOutSampleRate = 24000; // Gemini output: 24 kHz PCM
+const int    _kInSampleRate  = 16000; // Gemini input:  16 kHz PCM
+const int    _kFeedThreshold = 4800;  // ~200 ms worth of frames at 24 kHz
 
-// ── Palette (unchanged) ────────────────────────────────────────────────────────
+// ── Palette ────────────────────────────────────────────────────────────────────
 const _kBg      = Color(0xFF0A0A0F);
 const _kSurface = Color(0xFF111118);
 const _kPanel   = Color(0xFF16161F);
@@ -116,17 +134,17 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   // ── Session & messages ───────────────────────────────────────────────────────
   String _sessionId = const Uuid().v4();
   final List<ChatMessage> _messages = [];
-  AppStatus _status = AppStatus.disconnected;
-  bool _isRecording  = false;
-  bool _showThinking = false;
-  bool _speakerMode = false; // current speaker mode (from server)
+  AppStatus _status     = AppStatus.disconnected;
+  bool _isRecording     = false;
+  bool _showThinking    = false;
+  bool _speakerMode     = false;
 
   // ── Controllers ──────────────────────────────────────────────────────────────
   final ScrollController      _scrollCtrl = ScrollController();
   final TextEditingController _textCtrl   = TextEditingController();
   final FocusNode             _textFocus  = FocusNode();
 
-  // ── WebSocket (single connection) ────────────────────────────────────────────
+  // ── WebSocket ─────────────────────────────────────────────────────────────────
   WebSocketChannel?   _ws;
   StreamSubscription? _wsSub;
 
@@ -138,14 +156,13 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   final List<Uint8List> _audioQueue = [];
   bool _isPlaying = false;
 
-  // ── Turn tracking ────────────────────────────────────────────────────────────
-  // Both the user voice bubble and the AI reply bubble stream in as fragments.
-  // We track the in-progress bubble ID for each role so we can append fragments
-  // to the right bubble and create a fresh one on every new turn.
-  // Both IDs are cleared on turn_complete and on every new input action.
-  bool _inTurn = false;
-  String? _currentAiMessageId;        // AI bubble being built this turn
-  String? _currentUserVoiceMessageId; // User voice bubble being built this turn
+  // ── Turn tracking ─────────────────────────────────────────────────────────────
+  // The user voice bubble and the AI reply bubble both stream in as fragments.
+  // We track the in-progress bubble ID for each role so fragments append to the
+  // right bubble. Both IDs are cleared on turn_complete and on new input.
+  bool    _inTurn                    = false;
+  String? _currentAiMessageId;
+  String? _currentUserVoiceMessageId;
 
   // ── Mic animation ─────────────────────────────────────────────────────────────
   late AnimationController _pulseCtrl;
@@ -194,10 +211,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _ws = null;
   }
 
-  // ── Incoming message handler (both JSON and binary) ──────────────────────────
+  // ── Incoming message handler ──────────────────────────────────────────────────
   void _onMessage(dynamic raw) {
     if (raw is Uint8List) {
-      // Binary PCM audio (24 kHz) – only sent when speaker mode is on
       _enqueueAudio(raw);
     } else if (raw is List<int>) {
       _enqueueAudio(Uint8List.fromList(raw));
@@ -206,7 +222,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     }
   }
 
-  // ── JSON frame handler ───────────────────────────────────────────────────────
+  // ── JSON frame handler ────────────────────────────────────────────────────────
   void _handleJson(String raw) {
     Map<String, dynamic> data;
     try {
@@ -220,47 +236,34 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     switch (type) {
       case 'session_ready':
         _setStatus(AppStatus.ready);
-        _speakerMode = data['speaker_mode'] as bool? ?? false;
+        setState(() => _speakerMode = data['speaker_mode'] as bool? ?? false);
         break;
 
       case 'user_transcript':
-      // input_audio_transcription arrives as multiple partial fragments per turn
-      // (same behaviour as output_audio_transcription for the AI side).
-      // We append each fragment to the same bubble, identified by
-      // _currentUserVoiceMessageId, which is reset on every new voice turn
-      // so the next turn always gets a brand-new bubble.
+      // Input transcription arrives as multiple partial fragments during a turn.
+      // Append each fragment to the same bubble until the turn resets.
         final fragment = data['text'] as String? ?? '';
         if (fragment.isEmpty) return;
         setState(() {
           if (_currentUserVoiceMessageId != null) {
-            // Append fragment to the in-progress user bubble
-            final index = _messages.indexWhere((m) => m.id == _currentUserVoiceMessageId);
-            if (index != -1) {
-              final current = _messages[index].text;
-              final needsSpace = current.isNotEmpty &&
-                  !current.endsWith(' ') &&
-                  !fragment.startsWith(' ');
-              _messages[index].text = needsSpace
-                  ? '$current $fragment'
-                  : '$current$fragment';
+            final idx = _messages.indexWhere((m) => m.id == _currentUserVoiceMessageId);
+            if (idx != -1) {
+              final cur = _messages[idx].text;
+              final needSpace = cur.isNotEmpty && !cur.endsWith(' ') && !fragment.startsWith(' ');
+              _messages[idx].text = needSpace ? '$cur $fragment' : '$cur$fragment';
             } else {
-              // Bubble was removed unexpectedly — start a new one
+              // bubble removed unexpectedly — create a new one
               _currentUserVoiceMessageId = _uuid();
               _messages.add(ChatMessage(
-                id: _currentUserVoiceMessageId!,
-                role: MessageRole.user,
-                kind: MessageKind.voice,
-                text: fragment,
+                id: _currentUserVoiceMessageId!, role: MessageRole.user,
+                kind: MessageKind.voice, text: fragment,
               ));
             }
           } else {
-            // First fragment of a new voice turn — create the bubble
             _currentUserVoiceMessageId = _uuid();
             _messages.add(ChatMessage(
-              id: _currentUserVoiceMessageId!,
-              role: MessageRole.user,
-              kind: MessageKind.voice,
-              text: fragment,
+              id: _currentUserVoiceMessageId!, role: MessageRole.user,
+              kind: MessageKind.voice, text: fragment,
             ));
           }
         });
@@ -268,44 +271,31 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         break;
 
       case 'assistant_text':
-      // output_audio_transcription arrives as multiple partial fragments per turn.
+      // Output transcription arrives as multiple partial fragments.
       // Do NOT trim — Gemini uses leading spaces as natural word separators.
-      // Append every fragment to the same bubble until turn_complete resets the turn.
         final fragment = data['text'] as String? ?? '';
         if (fragment.isEmpty) return;
         setState(() {
           _showThinking = false;
           if (_inTurn && _currentAiMessageId != null) {
-            // Append fragment to the in-progress AI bubble
-            final index = _messages.indexWhere((m) => m.id == _currentAiMessageId);
-            if (index != -1) {
-              final current = _messages[index].text;
-              // Insert a space only when neither side already has one
-              final needsSpace = current.isNotEmpty &&
-                  !current.endsWith(' ') &&
-                  !fragment.startsWith(' ');
-              _messages[index].text = needsSpace
-                  ? '$current $fragment'
-                  : '$current$fragment';
+            final idx = _messages.indexWhere((m) => m.id == _currentAiMessageId);
+            if (idx != -1) {
+              final cur = _messages[idx].text;
+              final needSpace = cur.isNotEmpty && !cur.endsWith(' ') && !fragment.startsWith(' ');
+              _messages[idx].text = needSpace ? '$cur $fragment' : '$cur$fragment';
             } else {
-              // Bubble removed unexpectedly — start a fresh one
               _currentAiMessageId = _uuid();
               _messages.add(ChatMessage(
-                id: _currentAiMessageId!,
-                role: MessageRole.ai,
-                kind: MessageKind.text,
-                text: fragment,
+                id: _currentAiMessageId!, role: MessageRole.ai,
+                kind: MessageKind.text, text: fragment,
               ));
             }
           } else {
-            // First fragment of a new turn — create the bubble
             _inTurn = true;
             _currentAiMessageId = _uuid();
             _messages.add(ChatMessage(
-              id: _currentAiMessageId!,
-              role: MessageRole.ai,
-              kind: MessageKind.text,
-              text: fragment,
+              id: _currentAiMessageId!, role: MessageRole.ai,
+              kind: MessageKind.text, text: fragment,
             ));
           }
         });
@@ -313,37 +303,31 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         break;
 
       case 'tool_call':
-      // Tool call card
         _addMessage(ChatMessage(
-          id: _uuid(),
-          role: MessageRole.ai,
-          kind: MessageKind.toolCall,
+          id: _uuid(), role: MessageRole.ai, kind: MessageKind.toolCall,
           text: data['tool'] as String? ?? 'tool',
           toolData: Map<String, dynamic>.from(data),
         ));
         break;
 
       case 'turn_complete':
-      // End of turn — reset both streaming IDs so the next turn gets fresh bubbles
         setState(() {
-          _inTurn = false;
-          _currentAiMessageId = null;
+          _inTurn                    = false;
+          _currentAiMessageId        = null;
           _currentUserVoiceMessageId = null;
+          _showThinking              = false;
         });
+        if (_status == AppStatus.processing) _setStatus(AppStatus.ready);
         break;
 
       case 'speaker_mode_updated':
-        setState(() {
-          _speakerMode = data['enabled'] as bool? ?? false;
-        });
+        setState(() => _speakerMode = data['enabled'] as bool? ?? false);
         break;
 
       case 'error':
         _setStatus(AppStatus.error);
         _addMessage(ChatMessage(
-          id: _uuid(),
-          role: MessageRole.ai,
-          kind: MessageKind.text,
+          id: _uuid(), role: MessageRole.ai, kind: MessageKind.text,
           text: '⚠️ ${data['message'] ?? 'Unknown error'}',
         ));
         break;
@@ -353,7 +337,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         break;
 
       default:
-      // Ignore unknown types
         break;
     }
   }
@@ -387,7 +370,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   List<int> _bytesToInt16(Uint8List bytes) {
-    final bd = bytes.buffer.asByteData();
+    final bd  = bytes.buffer.asByteData();
     final out = <int>[];
     for (var i = 0; i + 1 < bytes.length; i += 2) {
       out.add(bd.getInt16(i, Endian.little));
@@ -396,6 +379,22 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   // ── Voice recording ───────────────────────────────────────────────────────────
+  //
+  // STREAMING DESIGN — NO LOCAL BUFFERING
+  // ──────────────────────────────────────
+  // _startRecording:
+  //   1. Request mic permission.
+  //   2. Send {"type":"voice_start"} — server sends activity_start to Gemini
+  //      and spawns a background response-consumer task.
+  //   3. Reset turn-tracking IDs so incoming transcripts get fresh bubbles.
+  //   4. Open the PCM stream; each chunk is sent as a raw binary WebSocket
+  //      frame immediately — the server forwards it to Gemini without buffering.
+  //
+  // _stopRecording:
+  //   1. Stop the mic stream so no more binary frames are sent.
+  //   2. Send {"type":"voice_end"} — server sends activity_end to Gemini and
+  //      awaits the full response from its background task.
+  //
   Future<void> _startRecording() async {
     if (_isRecording) return;
 
@@ -410,20 +409,34 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
     if (_ws == null) _connect();
 
-    // Send voice_start
+    // Signal the server that the user's voice turn is starting.
+    // The server will immediately send activity_start to Gemini and launch
+    // its background response-consumer — so Gemini is ready before the first
+    // audio chunk even arrives.
     _sendJson({'type': 'voice_start'});
 
+    // Clear turn state so the first user_transcript fragment creates a fresh
+    // bubble, not one left over from a previous turn.
+    setState(() {
+      _inTurn                    = false;
+      _currentAiMessageId        = null;
+      _currentUserVoiceMessageId = null;
+      _showThinking              = false;
+    });
+
     final stream = await _recorder.startStream(const RecordConfig(
-      encoder:     AudioEncoder.pcm16bits,
-      sampleRate:  _kInSampleRate,
-      numChannels: 1,
-      echoCancel:  true,
+      encoder:       AudioEncoder.pcm16bits,
+      sampleRate:    _kInSampleRate,
+      numChannels:   1,
+      echoCancel:    true,
       noiseSuppress: true,
-      autoGain:    true,
+      autoGain:      true,
     ));
 
-    _recordSub = stream.listen((chunk) {
-      // Send raw PCM chunks while recording
+    // Stream each chunk directly to the WebSocket — zero local buffering.
+    // The server enqueues each chunk as an AUDIO_CHUNK frame and the
+    // session_runner forwards it to Gemini via send_realtime_input immediately.
+    _recordSub = stream.listen((Uint8List chunk) {
       _ws?.sink.add(chunk);
     });
 
@@ -438,19 +451,18 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   Future<void> _stopRecording() async {
     if (!_isRecording) return;
 
+    // Stop the mic first so no more binary frames are emitted.
     await _recordSub?.cancel();
     _recordSub = null;
     await _recorder.stop();
 
-    // Send voice_end
+    // Signal the server that the user has finished speaking.
+    // The server sends activity_end to Gemini, which then generates a response.
     _sendJson({'type': 'voice_end'});
 
     setState(() {
       _isRecording  = false;
       _showThinking = true;
-      _inTurn = false;               // new turn about to start
-      _currentAiMessageId = null;
-      _currentUserVoiceMessageId = null; // fresh bubble for this utterance
     });
     _pulseCtrl
       ..stop()
@@ -464,7 +476,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     if (text.isEmpty) return;
     if (_ws == null) _connect();
 
-    // Show user bubble immediately
     _addMessage(ChatMessage(
       id: _uuid(), role: MessageRole.user, kind: MessageKind.text, text: text,
     ));
@@ -478,27 +489,24 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     });
 
     _sendJson({'type': 'text_input', 'text': text});
+
     _setStatus(AppStatus.processing);
   }
 
   // ── Speaker toggle ────────────────────────────────────────────────────────────
   void _toggleSpeaker() {
     _sendJson({'type': 'set_speaker', 'enabled': !_speakerMode});
-    // Optimistic update; server will confirm with speaker_mode_updated
-    setState(() {
-      _speakerMode = !_speakerMode;
-    });
+    setState(() => _speakerMode = !_speakerMode); // optimistic
   }
 
   // ── Interrupt ─────────────────────────────────────────────────────────────────
   void _sendInterrupt() {
     _sendJson({'type': 'interrupt'});
-    // Clear audio queue immediately
     _audioQueue.clear();
     setState(() {
-      _showThinking = false;
-      _inTurn = false;
-      _currentAiMessageId = null;
+      _showThinking              = false;
+      _inTurn                    = false;
+      _currentAiMessageId        = null;
       _currentUserVoiceMessageId = null;
     });
   }
@@ -508,7 +516,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _disconnect();
     _audioQueue.clear();
     _isPlaying = false;
-
     setState(() {
       _sessionId                 = const Uuid().v4();
       _messages.clear();
@@ -519,7 +526,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       _currentUserVoiceMessageId = null;
       _speakerMode               = false;
     });
-
     _connect();
   }
 
@@ -544,9 +550,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   void _sendJson(Map<String, dynamic> json) {
-    if (_ws != null) {
-      _ws!.sink.add(jsonEncode(json));
-    }
+    _ws?.sink.add(jsonEncode(json));
   }
 
   String _uuid() => const Uuid().v4();
@@ -579,12 +583,10 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
   }
 
-  // ── Header with speaker toggle ────────────────────────────────────────────────
   Widget _buildHeader(String statusLabel, Color statusColor) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Row(children: [
-        // Logo
         Container(
           width: 40, height: 40,
           decoration: BoxDecoration(
@@ -599,7 +601,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           child: const Center(child: Text('🚗', style: TextStyle(fontSize: 20))),
         ),
         const SizedBox(width: 12),
-        // Title + status
         Expanded(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const Text(
@@ -633,8 +634,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                   _speakerMode ? 'ON' : 'OFF',
                   style: TextStyle(
                     color: _speakerMode ? _kAccent : _kMuted,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
+                    fontSize: 12, fontWeight: FontWeight.w600,
                   ),
                 ),
               ],
@@ -642,7 +642,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           ),
         ),
         const SizedBox(width: 8),
-        // Interrupt button
+        // Interrupt
         GestureDetector(
           onTap: _sendInterrupt,
           child: Container(
@@ -672,7 +672,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
   }
 
-  // ── Message list (unchanged from previous) ────────────────────────────────────
   Widget _buildMessageList() {
     final count = _messages.length + (_showThinking ? 1 : 0);
 
@@ -684,8 +683,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             decoration: BoxDecoration(
               gradient: const LinearGradient(
                 colors: [_kAccent, _kAccent2],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
+                begin: Alignment.topLeft, end: Alignment.bottomRight,
               ),
               borderRadius: BorderRadius.circular(20),
               boxShadow: [BoxShadow(color: _kAccent.withValues(alpha: 0.25), blurRadius: 24)],
@@ -713,14 +711,12 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
   }
 
-  // ── Input bar (unchanged) ─────────────────────────────────────────────────────
   Widget _buildInputBar() {
     return Container(
       color: _kSurface,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-
-        // Mic button (hold to record)
+        // Mic button — tap once to start, tap again to stop
         GestureDetector(
           onLongPressStart: (_) => _startRecording(),
           onLongPressEnd:   (_) => _stopRecording(),
@@ -750,10 +746,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             ),
           ),
         ),
-
         const SizedBox(width: 10),
-
-        // Text field
         Expanded(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 120),
@@ -785,10 +778,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             ),
           ),
         ),
-
         const SizedBox(width: 10),
-
-        // Send button
         GestureDetector(
           onTap: _sendText,
           child: Container(
@@ -796,7 +786,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: _kAccent,
-              boxShadow: [BoxShadow(color: _kAccent.withValues(alpha: 0.35), blurRadius: 12, spreadRadius: 1)],
+              boxShadow: [BoxShadow(
+                color: _kAccent.withValues(alpha: 0.35), blurRadius: 12, spreadRadius: 1,
+              )],
             ),
             child: const Icon(Icons.send_rounded, color: Colors.white, size: 20),
           ),
@@ -806,7 +798,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 }
 
-// ── Status pill (unchanged) ────────────────────────────────────────────────────
+// ── Status pill ────────────────────────────────────────────────────────────────
 class _StatusPill extends StatefulWidget {
   final String label;
   final Color  color;
@@ -846,7 +838,7 @@ class _StatusPillState extends State<_StatusPill> with SingleTickerProviderState
   }
 }
 
-// ── Thinking bubble (unchanged) ────────────────────────────────────────────────
+// ── Thinking bubble ────────────────────────────────────────────────────────────
 class _ThinkingBubble extends StatefulWidget {
   const _ThinkingBubble();
   @override
@@ -887,7 +879,7 @@ class _ThinkingBubbleState extends State<_ThinkingBubble> with SingleTickerProvi
                 return AnimatedBuilder(
                   animation: _ctrl,
                   builder: (_, __) {
-                    final t = ((_ctrl.value * 3) - i).clamp(0.0, 1.0);
+                    final t  = ((_ctrl.value * 3) - i).clamp(0.0, 1.0);
                     final dy = -5.0 * (t < 0.5 ? t * 2 : (1 - t) * 2);
                     return Transform.translate(
                       offset: Offset(0, dy),
@@ -908,7 +900,7 @@ class _ThinkingBubbleState extends State<_ThinkingBubble> with SingleTickerProvi
   }
 }
 
-// ── Message bubble (unchanged) ─────────────────────────────────────────────────
+// ── Message bubble ─────────────────────────────────────────────────────────────
 class _MessageBubble extends StatelessWidget {
   final ChatMessage message;
   const _MessageBubble({required this.message});
@@ -977,7 +969,7 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
-// ── Tool call card (unchanged) ─────────────────────────────────────────────────
+// ── Tool call card ─────────────────────────────────────────────────────────────
 class _ToolCallCard extends StatelessWidget {
   final Map<String, dynamic> data;
   const _ToolCallCard({required this.data});
@@ -1010,7 +1002,6 @@ class _ToolCallCard extends StatelessWidget {
         border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        // Header row
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
@@ -1037,7 +1028,6 @@ class _ToolCallCard extends StatelessWidget {
             ),
           ]),
         ),
-        // Args + Result
         Padding(
           padding: const EdgeInsets.all(12),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
